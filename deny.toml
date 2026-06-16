@@ -1,0 +1,31 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
+#
+# Run `cargo deny check` to validate; runs in `just ci`.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause", # this crate + cros-libva / cros-codecs
+    "ISC",
+    "MIT", # libva headers + most deps
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

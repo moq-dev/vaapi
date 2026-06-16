@@ -1,0 +1,12 @@
+# Rust build output
+/target
+Cargo.lock
+
+# nix
+/result
+/.direnv
+
+# editors / OS
+.DS_Store
+.idea
+*.local
