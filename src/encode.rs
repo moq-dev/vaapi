@@ -1,3 +1,10 @@
+// Copyright 2022 The ChromiumOS Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+//
+// Adapted from discord/cros-codecs (encoder/stateless/h264/vaapi.rs), itself
+// BSD-3-Clause / Copyright The ChromiumOS Authors. See LICENSE.cros-codecs.
+
 //! Thin VA-API H.264 encoder built on the vendored libva binding.
 //!
 //! Reuses the backend-agnostic bitstream layer ([`crate::codec::h264`]) from

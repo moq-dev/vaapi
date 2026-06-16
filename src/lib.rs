@@ -7,7 +7,7 @@
 //! The starting point to using this crate is to open a [`Display`], from which a [`Context`] and
 //! [`Surface`]s can be allocated and used for doing actual work.
 
-// Most of this crate is vendored verbatim from cros-libva + discord/cros-codecs
+// Most of this crate is derived from discord/cros-libva + discord/cros-codecs
 // (BSD-3-Clause). Don't subject upstream code to this workspace's strict lints;
 // the build script also emits custom `libva_*_or_higher` cfgs.
 #![allow(dead_code, unused_imports, unexpected_cfgs, mismatched_lifetime_syntaxes)]

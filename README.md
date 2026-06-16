@@ -1,8 +1,17 @@
 # moq-vaapi
 
+> **⚠️ AI GENERATED.** This crate was written by an AI agent (Claude), using the
+> repositories below as references. How closely individual files track upstream
+> varies and the emitted bitstream has not been validated at playback — treat the
+> whole thing as derived, unverified work and review before relying on it.
+
 A small, self-contained **VA-API H.264 hardware encoder** for Linux (Intel / AMD),
-vendored and trimmed from [cros-libva](https://github.com/intel/cros-libva) and
-[discord/cros-codecs](https://github.com/discord/cros-codecs) (BSD-3-Clause).
+derived from
+[discord/cros-libva @ discord-0.0.13](https://github.com/discord/cros-libva/tree/discord-0.0.13)
+and
+[discord/cros-codecs @ discord-0.0.5](https://github.com/discord/cros-codecs/tree/discord-0.0.5)
+— both BSD-3-Clause, themselves forks of Intel's
+[cros-libva](https://github.com/intel/cros-libva) (ChromiumOS).
 
 It exists to give [moq](https://github.com/moq-dev/moq)'s `moq-video` a thin,
 crates.io-publishable VA-API encoder brick instead of a multi-backend framework
