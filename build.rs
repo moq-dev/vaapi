@@ -60,11 +60,10 @@ fn generate_vendored_version_header(out_dir: &Path) -> (u32, u32) {
 }
 
 fn main() {
-	// Do not require dependencies when generating docs.
-	if std::env::var("CARGO_DOC").is_ok() || std::env::var("DOCS_RS").is_ok() {
-		return;
-	}
-
+	// NOTE: do not short-circuit for docs builds (CARGO_DOC / DOCS_RS). `src/bindings.rs`
+	// `include!`s the generated `$OUT_DIR/bindings.rs`, so skipping bindgen makes
+	// `cargo doc` (and docs.rs) fail to compile. The build is hermetic — it only needs
+	// libclang and the vendored headers, both available on docs.rs — so always generate.
 	let out_dir = PathBuf::from(env::var("OUT_DIR").expect("`OUT_DIR` is not set"));
 
 	// Always build against the vendored libva headers (checked into `libva/`,
