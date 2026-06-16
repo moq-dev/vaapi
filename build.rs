@@ -66,10 +66,10 @@ fn main() {
 	// libclang and the vendored headers, both available on docs.rs — so always generate.
 	let out_dir = PathBuf::from(env::var("OUT_DIR").expect("`OUT_DIR` is not set"));
 
-	// Always build against the vendored libva headers (checked into `libva/`,
-	// pinned to a known VA-API version) and dlopen libva at runtime rather than
-	// link it. There is no system-libva path, so the build needs only libclang for
-	// bindgen and works on any OS.
+	// Bindings are generated from the vendored libva headers (checked into `libva/`,
+	// pinned to a known VA-API version so a system libva bump can't drift them).
+	// libva itself is linked on Linux (see below). The rlib compile needs only
+	// libclang + the vendored headers, so it builds on any OS for development.
 	let (major, minor) = generate_vendored_version_header(&out_dir);
 	println!("cargo:rerun-if-changed=libva/meson.build");
 	println!("cargo:rerun-if-changed=libva/va/va_version.h.in");
@@ -120,6 +120,21 @@ fn main() {
 	}
 	if va_check_version(1, 10) {
 		println!("cargo::rustc-cfg=libva_1_10_or_higher");
+	}
+
+	// Bindings are generated from the vendored headers (pinned, drift-proof), but
+	// the va* symbols still have to resolve, so link the system libva on Linux (the
+	// only platform with VA-API). VA-API's ABI is stable, so a system libva newer
+	// than the vendored headers links fine. On other hosts (e.g. macOS) this crate
+	// only ever builds as an rlib, which leaves the symbols for the final binary, so
+	// skip linking and keep it compilable for development.
+	if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+		pkg_config::Config::new()
+			.probe("libva")
+			.expect("libva not found via pkg-config (install libva / libva-dev)");
+		pkg_config::Config::new()
+			.probe("libva-drm")
+			.expect("libva-drm not found via pkg-config (install libva / libva-dev)");
 	}
 
 	let bindings = vaapi_gen_builder(bindgen::builder())
