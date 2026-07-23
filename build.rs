@@ -122,21 +122,11 @@ fn main() {
 		println!("cargo::rustc-cfg=libva_1_10_or_higher");
 	}
 
-	// Bindings are generated from the vendored headers (pinned, drift-proof), but
-	// the va* symbols still have to resolve, so link the system libva on Linux (the
-	// only platform with VA-API). VA-API's ABI is stable, so a system libva newer
-	// than the vendored headers links fine. On other hosts (e.g. macOS) this crate
-	// only ever builds as an rlib, which leaves the symbols for the final binary, so
-	// skip linking and keep it compilable for development.
-	if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
-		pkg_config::Config::new()
-			.probe("libva")
-			.expect("libva not found via pkg-config (install libva / libva-dev)");
-		pkg_config::Config::new()
-			.probe("libva-drm")
-			.expect("libva-drm not found via pkg-config (install libva / libva-dev)");
-	}
-
+	// No link step: bindgen emits a `Va` struct that dlopen's libva at runtime
+	// (see bindgen_gen.rs and src/bindings.rs). So the build needs only libclang
+	// plus the vendored headers, and the binary carries no NEEDED libva, matching
+	// how the NVENC backend loads its driver. This is what lets docs.rs (and any
+	// libva-less Linux host) build the crate.
 	let bindings = vaapi_gen_builder(bindgen::builder())
 		.header(WRAPPER_PATH)
 		.clang_arg(format!("-I{}", va_h_path.display()))

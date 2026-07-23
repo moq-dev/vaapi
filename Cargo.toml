@@ -16,18 +16,20 @@ exclude = ["flake.nix", "flake.lock", "justfile", "deny.toml", "rust-toolchain.t
 
 # bindgen reads the vendored libva headers checked into `libva/` (refreshed by
 # `just vendor`, pinned to a known VA-API version so a system libva bump can't
-# drift the bindings); libva itself is linked on Linux via pkg-config (VA-API's
-# ABI is stable, so a newer system libva links fine against the pinned bindings).
-# The rlib build needs only libclang + the vendored headers, so it compiles on any
-# OS (e.g. macOS) for development; the libva link only happens on Linux.
+# drift the bindings). libva is not linked: bindgen's dynamic-loading mode emits a
+# `Va` struct that dlopen's libva.so at runtime (see bindgen_gen.rs), so the build
+# needs only libclang + the vendored headers, the binary carries no NEEDED libva
+# (a libva-less host loads and lets the caller fall back), and the crate builds on
+# any OS (macOS, docs.rs) without libva installed.
 
 [dependencies]
 anyhow = "1"
 thiserror = "1"
 bitflags = "2.5"
 log = { version = "0", features = ["release_max_level_debug"] }
+# Runtime dlopen of libva; the bindgen `Va` struct is built on libloading::Library.
+libloading = "0.8"
 
 [build-dependencies]
 bindgen = "0.70.1"
-pkg-config = "0.3.31"
 regex = "1.11.1"

@@ -95,7 +95,7 @@ impl std::fmt::Display for VaError {
 
 		// Safe because `vaErrorStr` will return a pointer to a statically allocated, null
 		// terminated C string. The pointer is guaranteed to never be null.
-		let err_str = unsafe { CStr::from_ptr(bindings::vaErrorStr(self.0.get())) }
+		let err_str = unsafe { CStr::from_ptr(bindings::va().vaErrorStr(self.0.get())) }
 			.to_str()
 			.unwrap();
 		f.write_str(err_str)

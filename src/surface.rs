@@ -223,7 +223,7 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
 			// Also all the pointers in `attrs` are pointing to valid objects that haven't been
 			// moved or destroyed.
 			match va_check(unsafe {
-				bindings::vaCreateSurfaces(
+				bindings::va().vaCreateSurfaces(
 					display.handle(),
 					rt_format,
 					width,
@@ -259,7 +259,7 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
 	/// is safe to use the render target for a different picture.
 	pub fn sync(&self) -> Result<(), VaError> {
 		// Safe because `self` represents a valid VASurface.
-		va_check(unsafe { bindings::vaSyncSurface(self.display.handle(), self.id) })
+		va_check(unsafe { bindings::va().vaSyncSurface(self.display.handle(), self.id) })
 	}
 
 	/// Convenience function to return a VASurfaceID vector. Useful to interface with the C API
@@ -272,7 +272,7 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
 	pub fn query_status(&self) -> Result<bindings::VASurfaceStatus::Type, VaError> {
 		let mut status: bindings::VASurfaceStatus::Type = 0;
 		// Safe because `self` represents a valid VASurface.
-		va_check(unsafe { bindings::vaQuerySurfaceStatus(self.display.handle(), self.id, &mut status) })?;
+		va_check(unsafe { bindings::va().vaQuerySurfaceStatus(self.display.handle(), self.id, &mut status) })?;
 
 		Ok(status)
 	}
@@ -282,7 +282,7 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
 
 		// Safe because `self` represents a valid VASurface.
 		va_check(unsafe {
-			bindings::vaQuerySurfaceError(
+			bindings::va().vaQuerySurfaceError(
 				self.display.handle(),
 				self.id,
 				bindings::VA_STATUS_ERROR_DECODING_ERROR as i32,
@@ -342,7 +342,7 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
 		let mut desc: bindings::VADRMPRIMESurfaceDescriptor = Default::default();
 
 		va_check(unsafe {
-			bindings::vaExportSurfaceHandle(
+			bindings::va().vaExportSurfaceHandle(
 				self.display.handle(),
 				self.id(),
 				bindings::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
@@ -413,7 +413,7 @@ impl<D: SurfaceMemoryDescriptor> AsMut<D> for Surface<D> {
 impl<D: SurfaceMemoryDescriptor> Drop for Surface<D> {
 	fn drop(&mut self) {
 		// Safe because `self` represents a valid VASurface.
-		unsafe { bindings::vaDestroySurfaces(self.display.handle(), &mut self.id, 1) };
+		unsafe { bindings::va().vaDestroySurfaces(self.display.handle(), &mut self.id, 1) };
 	}
 }
 

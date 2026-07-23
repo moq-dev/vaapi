@@ -44,7 +44,7 @@ impl Config {
 		// The `attrs` vector is also properly initialized and its actual size is passed to
 		// `vaCreateConfig`, so it is impossible to write past the end of its storage by mistake.
 		va_check(unsafe {
-			bindings::vaCreateConfig(
+			bindings::va().vaCreateConfig(
 				display.handle(),
 				profile,
 				entrypoint,
@@ -73,7 +73,7 @@ impl Config {
 		// call to `vaQuerySurfaceAttributes`.
 		let attrs_len: std::os::raw::c_uint = 0;
 		va_check(unsafe {
-			bindings::vaQuerySurfaceAttributes(
+			bindings::va().vaQuerySurfaceAttributes(
 				self.display.handle(),
 				self.id,
 				std::ptr::null_mut(),
@@ -86,7 +86,7 @@ impl Config {
 		// returned by the initial call to vaQuerySurfaceAttributes. We then
 		// pass a valid pointer to it.
 		va_check(unsafe {
-			bindings::vaQuerySurfaceAttributes(
+			bindings::va().vaQuerySurfaceAttributes(
 				self.display.handle(),
 				self.id,
 				attrs.as_mut_ptr(),
@@ -122,7 +122,7 @@ impl Config {
 impl Drop for Config {
 	fn drop(&mut self) {
 		// Safe because `self` represents a valid Config.
-		let status = va_check(unsafe { bindings::vaDestroyConfig(self.display.handle(), self.id) });
+		let status = va_check(unsafe { bindings::va().vaDestroyConfig(self.display.handle(), self.id) });
 
 		if status.is_err() {
 			error!("vaDestroyConfig failed: {}", status.unwrap_err());

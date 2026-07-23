@@ -53,7 +53,7 @@ impl<'a> Image<'a> {
 
 		// Safe since `picture.inner.context` represents a valid `VAContext` and `image` has been
 		// successfully created at this point.
-		match va_check(unsafe { bindings::vaMapBuffer(surface.display().handle(), image.buf, &mut addr) }) {
+		match va_check(unsafe { bindings::va().vaMapBuffer(surface.display().handle(), image.buf, &mut addr) }) {
 			Ok(_) => {
 				// Assert that libva provided us with a coded resolution that is
 				// at least as large as `display_resolution`.
@@ -78,7 +78,7 @@ impl<'a> Image<'a> {
 				// Safe because `picture.inner.context` represents a valid `VAContext` and `image`
 				// represents a valid `VAImage`.
 				unsafe {
-					bindings::vaDestroyImage(surface.display().handle(), image.image_id);
+					bindings::va().vaDestroyImage(surface.display().handle(), image.image_id);
 				}
 
 				Err(e)
@@ -100,7 +100,7 @@ impl<'a> Image<'a> {
 		let mut image: bindings::VAImage = Default::default();
 
 		// Safe because `self` has a valid display handle and ID.
-		va_check(unsafe { bindings::vaDeriveImage(surface.display().handle(), surface.id(), &mut image) })?;
+		va_check(unsafe { bindings::va().vaDeriveImage(surface.display().handle(), surface.id(), &mut image) })?;
 
 		Self::new(surface, image, true, visible_rect)
 	}
@@ -124,7 +124,7 @@ impl<'a> Image<'a> {
 
 		// Safe because `dpy` is a valid display handle.
 		va_check(unsafe {
-			bindings::vaCreateImage(
+			bindings::va().vaCreateImage(
 				dpy,
 				&mut format,
 				coded_resolution.0 as i32,
@@ -136,7 +136,7 @@ impl<'a> Image<'a> {
 		// Safe because `dpy` is a valid display handle, `picture.surface` is a valid VASurface and
 		// `image` is a valid `VAImage`.
 		match va_check(unsafe {
-			bindings::vaGetImage(
+			bindings::va().vaGetImage(
 				dpy,
 				surface.id(),
 				0,
@@ -151,7 +151,7 @@ impl<'a> Image<'a> {
 			Err(e) => {
 				// Safe because `image` is a valid `VAImage`.
 				unsafe {
-					bindings::vaDestroyImage(dpy, image.image_id);
+					bindings::va().vaDestroyImage(dpy, image.image_id);
 				}
 
 				Err(e)
@@ -203,7 +203,7 @@ impl<'a> Drop for Image<'a> {
 			// `picture.surface` represents a valid `VASurface` and `image` represents a valid
 			// `VAImage`.
 			unsafe {
-				bindings::vaPutImage(
+				bindings::va().vaPutImage(
 					self.display.handle(),
 					self.surface_id,
 					self.image.image_id,
@@ -222,9 +222,9 @@ impl<'a> Drop for Image<'a> {
 		unsafe {
 			// Safe since the buffer is mapped in `Image::new`, so `self.image.buf` points to a
 			// valid `VABufferID`.
-			bindings::vaUnmapBuffer(self.display.handle(), self.image.buf);
+			bindings::va().vaUnmapBuffer(self.display.handle(), self.image.buf);
 			// Safe since `self.image` represents a valid `VAImage`.
-			bindings::vaDestroyImage(self.display.handle(), self.image.image_id);
+			bindings::va().vaDestroyImage(self.display.handle(), self.image.image_id);
 		}
 	}
 }
