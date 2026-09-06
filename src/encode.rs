@@ -47,8 +47,19 @@ pub enum IsReference {
 	LongTerm,
 }
 
-const MIN_QP: u8 = 1;
-const MAX_QP: u8 = 51;
+/// Quantizer bounds carried over from the cros-codecs encoder.
+///
+/// The full H.264 range lets Intel's CBR controller spend too much of a GOP on
+/// its IDR and then raise the P-frame quantizer enough to produce a visible
+/// quality pulse. These bounds trade strict CBR at the extremes for stable
+/// picture quality.
+const MIN_QP: u8 = 18;
+const MAX_QP: u8 = 36;
+/// Window over which libva's rate controller targets the configured bitrate.
+///
+/// This matches cros-codecs. The old `framerate * 1000` value confused frames
+/// per second with seconds and gave a 30 fps encoder a 30-second window.
+const RATE_CONTROL_WINDOW_MS: u32 = 1_500;
 /// `max_frame_num` upper bound for the low-delay GOP; matches cros-codecs.
 const LIMIT: u32 = 2048;
 
@@ -235,12 +246,14 @@ impl Encoder {
 
 		let rc = EncMiscParameterRateControl::new(
 			bits_per_second,
-			100,                                 // target_percentage (CBR)
-			self.config.framerate.max(1) * 1000, // window_size (ms)
-			26,                                  // initial_qp
+			100,                    // target_percentage (CBR)
+			RATE_CONTROL_WINDOW_MS, // window_size (ms)
+			u32::from((MIN_QP + MAX_QP) / 2),
 			MIN_QP as u32,
 			0, // basic_unit_size
-			RcFlags::default(),
+			// Do not let rate control drop a frame to meet the bitrate. A live
+			// encoder has already admitted this frame into the media timeline.
+			RcFlags::new(0, 1, 0, 0, 0, 0, 0, 0, 0),
 			0, // icq_quality_factor
 			MAX_QP as u32,
 			0, // quality_factor

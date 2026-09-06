@@ -15,9 +15,10 @@ check:
     cargo clippy --all-targets -- -D warnings
     cargo fmt --all --check
 
-# Full CI: check + dependency hygiene.
+# Full CI: check, unit tests, and dependency hygiene.
 ci:
     just check
+    cargo test --lib
     cargo deny check --show-stats
 
 # Auto-fix clippy + formatting.

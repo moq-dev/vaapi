@@ -2,10 +2,12 @@
 
 > **⚠️ AI GENERATED.** This crate was written by an AI agent (Claude), using the
 > repositories below as references. How closely individual files track upstream
-> varies and the emitted bitstream has not been validated at playback — treat the
-> whole thing as derived, unverified work and review before relying on it.
+> varies and the encoder's emitted bitstream has not been validated at playback —
+> treat the whole thing as derived, unverified work and review before relying on
+> it. The decoder is the exception: it has been checked against a software
+> reference on Intel hardware (see below).
 
-A small, self-contained **VA-API H.264 hardware encoder** for Linux (Intel / AMD),
+A small, self-contained **VA-API H.264 hardware codec** for Linux (Intel / AMD),
 derived from
 [discord/cros-libva @ discord-0.0.13](https://github.com/discord/cros-libva/tree/discord-0.0.13)
 and
@@ -14,13 +16,21 @@ and
 [cros-libva](https://github.com/intel/cros-libva) (ChromiumOS).
 
 It exists to give [moq](https://github.com/moq-dev/moq)'s `moq-video` a thin,
-crates.io-publishable VA-API encoder brick instead of a multi-backend framework
+crates.io-publishable VA-API codec brick instead of a multi-backend framework
 pulled in as a git dependency.
 
 ## What it does
 
 - **H.264 encode** over VA-API: tightly-packed NV12 in, an Annex-B elementary
   stream out (packed SPS/PPS + slice headers, low-latency IPPP, rate control).
+- **H.264 decode** over VA-API: one Annex-B access unit in, tightly-packed NV12
+  out, with in-stream parameter sets, a conformant DPB (reference marking,
+  reordering, frame_num gaps), and mid-stream resolution changes. Progressive
+  8-bit 4:2:0 only, with right/bottom cropping supported and left/top cropping
+  rejected. Verified bit-exact against ffmpeg's software decoder on Intel
+  Meteor Lake (iHD 26.1.5) for constrained baseline, main with B-frames, high at
+  720p, and a cropped non-macroblock-aligned size. The main-with-B-frames case
+  runs as a test wherever ffmpeg and a VA-API device are both present.
 - **Pinned, vendored headers.** libva's headers are vendored into
   [`libva/`](./libva) (see `just vendor`) and fed to bindgen, so generating the
   bindings needs **no system libva-dev** — only `libclang` — and the pinned
@@ -36,7 +46,7 @@ pulled in as a git dependency.
 
 - `src/` — libva bindings (`bindings`, `display`, `surface`, `buffer`, ...), the
   H.264 bitstream layer (`bitstream_utils`, `codec::h264`), and the thin encode
-  driver (`encode`).
+  and decode drivers (`encode`, `decode`).
 - `libva/` — vendored libva headers (checked in; refreshed by `just vendor`).
 - `build.rs` + `bindgen_gen.rs` + `libva-wrapper.h` — bindgen setup.
 
