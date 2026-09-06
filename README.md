@@ -26,7 +26,8 @@ pulled in as a git dependency.
 - **H.264 decode** over VA-API: one Annex-B access unit in, tightly-packed NV12
   out, with in-stream parameter sets, a conformant DPB (reference marking,
   reordering, frame_num gaps), and mid-stream resolution changes. Progressive
-  8-bit 4:2:0 only. Verified bit-exact against ffmpeg's software decoder on Intel
+  8-bit 4:2:0 only, with right/bottom cropping supported and left/top cropping
+  rejected. Verified bit-exact against ffmpeg's software decoder on Intel
   Meteor Lake (iHD 26.1.5) for constrained baseline, main with B-frames, high at
   720p, and a cropped non-macroblock-aligned size. The main-with-B-frames case
   runs as a test wherever ffmpeg and a VA-API device are both present.

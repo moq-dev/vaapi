@@ -30,6 +30,7 @@
 //! Progressive 8-bit 4:2:0 only: a sequence that is interlaced, deeper than 8
 //! bits, or not 4:2:0 is rejected rather than decoded wrongly. That covers every
 //! stream this crate's encoder, WebRTC, or a browser's `VideoEncoder` produces.
+//! Left and top cropping are rejected; right and bottom cropping are supported.
 
 use std::cell::{Cell, RefCell};
 use std::io::Cursor;
@@ -375,6 +376,7 @@ impl Decoder {
 	/// Applies `sps` to the DPB limits, rebuilding the VA config, context, and
 	/// surface pool if it changes anything they depend on.
 	fn apply_sps(&mut self, sps: &Sps) -> anyhow::Result<()> {
+		let info = SequenceInfo::new(sps)?;
 		// C.4.5.3: the DPB limits follow the active SPS whether or not the VA
 		// state has to be rebuilt.
 		let max_dpb_frames = sps.max_dpb_frames();
@@ -386,7 +388,6 @@ impl Decoder {
 		};
 		self.dpb.set_limits(max_dpb_frames, max_num_reorder_frames);
 
-		let info = SequenceInfo::new(sps);
 		if self.sequence.as_ref().map(|sequence| &sequence.info) == Some(&info) {
 			return Ok(());
 		}
@@ -476,7 +477,7 @@ impl Decoder {
 				.get_pps(slice.header.pic_parameter_set_id)
 				.context("slice refers to an unknown PPS")?,
 		);
-		if SequenceInfo::new(&pps.sps) != SequenceInfo::new(&current.pps.sps) {
+		if SequenceInfo::new(&pps.sps)? != SequenceInfo::new(&current.pps.sps)? {
 			bail!("invalid stream: the sequence changed between slices of one picture");
 		}
 		current.pps = Rc::clone(&pps);
@@ -1006,6 +1007,7 @@ impl std::borrow::Borrow<Surface<()>> for Handle {
 /// built from. A change in any of them forces them to be rebuilt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SequenceInfo {
+	visible: (u32, u32),
 	coded: (u32, u32),
 	profile_idc: u8,
 	bit_depth_luma_minus8: u8,
@@ -1016,8 +1018,46 @@ struct SequenceInfo {
 }
 
 impl SequenceInfo {
-	fn new(sps: &Sps) -> Self {
-		Self {
+	fn new(sps: &Sps) -> anyhow::Result<Self> {
+		if !sps.frame_mbs_only_flag {
+			bail!("interlaced H.264 is not supported");
+		}
+		if sps.chroma_format_idc != 1 {
+			bail!(
+				"only 4:2:0 chroma is supported, got chroma_format_idc {}",
+				sps.chroma_format_idc
+			);
+		}
+		if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+			bail!(
+				"only 8-bit samples are supported, got {}-bit luma and {}-bit chroma",
+				sps.bit_depth_luma_minus8 + 8,
+				sps.bit_depth_chroma_minus8 + 8
+			);
+		}
+
+		if sps.frame_cropping_flag && (sps.frame_crop_left_offset != 0 || sps.frame_crop_top_offset != 0) {
+			bail!("left and top H.264 cropping is not supported");
+		}
+		let (crop_right, crop_bottom) = if sps.frame_cropping_flag {
+			(sps.frame_crop_right_offset, sps.frame_crop_bottom_offset)
+		} else {
+			(0, 0)
+		};
+		let width = crop_right
+			.checked_mul(2)
+			.and_then(|crop| sps.width().checked_sub(crop))
+			.context("invalid horizontal H.264 crop")?;
+		let height = crop_bottom
+			.checked_mul(2)
+			.and_then(|crop| sps.height().checked_sub(crop))
+			.context("invalid vertical H.264 crop")?;
+		if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+			bail!("visible size {width}x{height} is not a non-zero even 4:2:0 size");
+		}
+
+		Ok(Self {
+			visible: (width, height),
 			coded: (sps.width(), sps.height()),
 			profile_idc: sps.profile_idc,
 			bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
@@ -1025,7 +1065,7 @@ impl SequenceInfo {
 			chroma_format_idc: sps.chroma_format_idc,
 			frame_mbs_only_flag: sps.frame_mbs_only_flag,
 			max_dpb_frames: sps.max_dpb_frames(),
-		}
+		})
 	}
 }
 
@@ -1044,29 +1084,7 @@ struct Sequence {
 
 impl Sequence {
 	fn new(display: &Arc<Display>, sps: &Sps, info: SequenceInfo) -> anyhow::Result<Self> {
-		if !sps.frame_mbs_only_flag {
-			bail!("interlaced H.264 is not supported");
-		}
-		if sps.chroma_format_idc != 1 {
-			bail!(
-				"only 4:2:0 chroma is supported, got chroma_format_idc {}",
-				sps.chroma_format_idc
-			);
-		}
-		if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
-			bail!(
-				"only 8-bit samples are supported, got {}-bit luma and {}-bit chroma",
-				sps.bit_depth_luma_minus8 + 8,
-				sps.bit_depth_chroma_minus8 + 8
-			);
-		}
-
-		let visible = sps.visible_rectangle();
-		let width = visible.max.x - visible.min.x;
-		let height = visible.max.y - visible.min.y;
-		if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
-			bail!("visible size {width}x{height} is not a non-zero even 4:2:0 size");
-		}
+		let (width, height) = info.visible;
 
 		let attrs = vec![VAConfigAttrib {
 			type_: VAConfigAttribType::VAConfigAttribRTFormat,
@@ -1543,8 +1561,8 @@ fn build_pic_param(
 		(pic.nal_ref_idc != 0) as u32,
 	);
 
-	let interlaced = !sps.frame_mbs_only_flag as u32;
-	let picture_height_in_mbs_minus1 = ((sps.pic_height_in_map_units_minus1 + 1) << interlaced) - 1;
+	// SequenceInfo rejects interlaced input, so map units are frame macroblocks.
+	let picture_height_in_mbs_minus1 = sps.pic_height_in_map_units_minus1;
 
 	BufferType::PictureParameter(PictureParameter::H264(PictureParameterBufferH264::new(
 		curr_pic,
@@ -1674,6 +1692,86 @@ mod tests {
 	use std::process::Command;
 
 	use super::*;
+
+	fn progressive_sps() -> Sps {
+		Sps {
+			frame_mbs_only_flag: true,
+			chroma_format_idc: 1,
+			pic_width_in_mbs_minus1: 19,
+			pic_height_in_map_units_minus1: 14,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn rejects_nonzero_crop_origins() {
+		for (left, top) in [(1, 0), (0, 1)] {
+			let sps = Sps {
+				frame_cropping_flag: true,
+				frame_crop_left_offset: left,
+				frame_crop_top_offset: top,
+				..progressive_sps()
+			};
+			assert!(SequenceInfo::new(&sps)
+				.unwrap_err()
+				.to_string()
+				.contains("left and top"));
+		}
+	}
+
+	#[test]
+	fn crop_only_updates_change_sequence_identity() {
+		let original = SequenceInfo::new(&progressive_sps()).unwrap();
+		for (right, bottom, expected) in [(1, 0, (318, 240)), (0, 1, (320, 238))] {
+			let cropped = SequenceInfo::new(&Sps {
+				frame_cropping_flag: true,
+				frame_crop_right_offset: right,
+				frame_crop_bottom_offset: bottom,
+				..progressive_sps()
+			})
+			.unwrap();
+			assert_eq!(original.coded, cropped.coded);
+			assert_eq!(cropped.visible, expected);
+			assert_ne!(original, cropped);
+		}
+	}
+
+	#[test]
+	fn rejects_invalid_crop_dimensions() {
+		for crop in [160, 161, u32::MAX] {
+			assert!(SequenceInfo::new(&Sps {
+				frame_cropping_flag: true,
+				frame_crop_right_offset: crop,
+				..progressive_sps()
+			})
+			.is_err());
+		}
+	}
+
+	#[test]
+	fn maximum_progressive_height_does_not_overflow_va_parameters() {
+		let sps = Rc::new(Sps {
+			pic_height_in_map_units_minus1: u16::MAX,
+			..progressive_sps()
+		});
+		let params = build_pic_param(
+			&SliceHeader::default(),
+			&PictureData::new_non_existing(0, 0),
+			VA_INVALID_ID,
+			&Dpb::default(),
+			&sps,
+			&crate::codec::h264::parser::PpsBuilder::new(Rc::clone(&sps)).build(),
+		);
+		let BufferType::PictureParameter(PictureParameter::H264(params)) = params else {
+			panic!("expected H.264 picture parameters");
+		};
+		assert_eq!(params.inner().picture_height_in_mbs_minus1, u16::MAX);
+		assert!(SequenceInfo::new(&Sps {
+			frame_mbs_only_flag: false,
+			..progressive_sps()
+		})
+		.is_err());
+	}
 
 	/// Encoder settings shared by the tests that need a stream rather than a
 	/// particular picture.
