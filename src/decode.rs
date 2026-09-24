@@ -32,11 +32,11 @@
 //! stream this crate's encoder, WebRTC, or a browser's `VideoEncoder` produces.
 //! Left and top cropping are rejected; right and bottom cropping are supported.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{anyhow, bail, Context as _};
 
@@ -59,15 +59,15 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct Config {
 	/// DRM render node to open (e.g. `/dev/dri/renderD128`).
-	pub device: PathBuf,
+	///
+	/// `None`, the default, opens the first node whose driver can decode H.264.
+	pub device: Option<PathBuf>,
 }
 
 impl Config {
-	/// Returns a configuration pointing at the default render node.
+	/// Returns a configuration that opens the first render node whose driver can decode H.264.
 	pub fn new() -> Self {
-		Self {
-			device: PathBuf::from("/dev/dri/renderD128"),
-		}
+		Self { device: None }
 	}
 }
 
@@ -106,6 +106,13 @@ pub struct Frame {
 /// [`ExportedFrame::download`] goes back through the surface instead of reading
 /// the file descriptor as rows.
 ///
+/// Dropping the frame hands its surface back to the decoder, which decodes a
+/// later picture into it. So keep the frame for as long as anything reads the
+/// descriptor or an import of it: a GPU consumer holds it until the work that
+/// samples it has finished, not merely until that work is submitted. A frame
+/// that outlives its decoder, or the sequence it was decoded in, releases its
+/// surface to the driver instead.
+///
 /// This is [`Send`] and [`Sync`] even though [`Decoder`] is neither: a surface
 /// is a display and an id, both of which libva serializes internally, and none
 /// of the decoder's `Rc`s come along.
@@ -120,10 +127,10 @@ pub struct ExportedFrame {
 	/// The surface's export: format, modifier, and the offset and pitch of each
 	/// plane.
 	pub descriptor: DrmPrimeSurfaceDescriptor,
-	/// The surface the picture was decoded into, retired from the decoder's pool
-	/// and held here so nothing draws over it and [`ExportedFrame::download`] has
-	/// something to map.
-	surface: Arc<Surface<()>>,
+	/// The surface the picture was decoded into, held here so the decoder does
+	/// not decode into it again until this drops, and so
+	/// [`ExportedFrame::download`] has something to map.
+	surface: Arc<PooledSurface>,
 }
 
 impl ExportedFrame {
@@ -152,7 +159,7 @@ impl ExportedFrame {
 			width,
 			height,
 			descriptor,
-			surface: Arc::new(surface),
+			surface: Arc::new(PooledSurface::unpooled(surface)),
 		})
 	}
 
@@ -165,7 +172,7 @@ impl ExportedFrame {
 	///
 	/// Same layout as [`Frame::data`], with the driver's row padding dropped.
 	pub fn download(&self) -> anyhow::Result<Frame> {
-		read_back(&self.surface, self.timestamp, self.width, self.height)
+		read_back(self.surface.get(), self.timestamp, self.width, self.height)
 	}
 }
 
@@ -230,19 +237,28 @@ pub struct Decoder {
 }
 
 impl Decoder {
-	/// Opens the render node and checks that the driver exposes an H.264 decode
-	/// entrypoint.
+	/// Opens [`Config::device`], or the first render node that decodes H.264,
+	/// and checks that the driver exposes an H.264 decode entrypoint.
 	///
 	/// The VA config, context, and surface pool are built later, from the first
 	/// SPS, since their profile and size come from the stream. This still fails
 	/// early enough for a caller to fall back to another decoder when libva is
-	/// missing, the node cannot be opened, or the driver decodes no H.264.
+	/// missing, the node cannot be opened, or the driver decodes no H.264. A
+	/// named node is never swapped for another.
 	pub fn new(config: Config) -> anyhow::Result<Self> {
-		let display = Display::open_drm_display(&config.device)
-			.map_err(|e| anyhow!("open DRM display {:?}: {e:?}", config.device))?;
-		probe_decode_entrypoint(&display)?;
+		let (device, display) = match config.device {
+			Some(device) => {
+				let display =
+					Display::open_drm_display(&device).map_err(|e| anyhow!("open DRM display {device:?}: {e:?}"))?;
+				probe(&display)?;
+				(device, display)
+			}
+			None => {
+				crate::display::open_first(probe).map_err(|e| e.context("find a render node that decodes H.264"))?
+			}
+		};
 
-		log::info!("opened VA-API H.264 decoder on {:?}", config.device);
+		log::info!("opened VA-API H.264 decoder on {device:?}");
 		Ok(Self {
 			parser: Parser::default(),
 			dpb: Dpb::default(),
@@ -275,15 +291,16 @@ impl Decoder {
 	/// copy of its pixels. For a consumer that draws on the GPU that is the
 	/// whole picture never touching system memory.
 	///
-	/// Exporting a surface retires it from the recycling pool, since the next
-	/// picture would otherwise be decoded over pixels the consumer still holds a
-	/// descriptor for. So this trades a surface allocation per picture for the
-	/// download, which is the right way round for anything that would only have
-	/// uploaded the pixels again.
+	/// An exported surface stays out of the recycling pool until the
+	/// [`ExportedFrame`] drops, since the next picture would otherwise be decoded
+	/// over pixels the consumer still holds a descriptor for. A consumer that
+	/// lets each picture go once it has drawn it therefore costs no allocation
+	/// per picture; one that holds on to pictures costs one surface per picture
+	/// held.
 	///
 	/// A consumer that turns out to want bytes after all is not stuck: the
-	/// retired surface travels with the descriptor, and
-	/// [`ExportedFrame::download`] reads it back.
+	/// surface travels with the descriptor, and [`ExportedFrame::download`] reads
+	/// it back.
 	pub fn decode_exported(&mut self, access_unit: &[u8], timestamp: u64) -> anyhow::Result<Vec<ExportedFrame>> {
 		self.submit(access_unit, timestamp)?;
 		self.take_exported()
@@ -459,7 +476,7 @@ impl Decoder {
 		let sequence = self.sequence.as_ref().expect("sequence built by apply_sps");
 		let context = Rc::clone(&sequence.context);
 		let handle = Handle {
-			surface: Rc::new(sequence.pool.alloc()?),
+			surface: Arc::new(sequence.pool.alloc()?),
 			timestamp,
 			width: sequence.width,
 			height: sequence.height,
@@ -1020,7 +1037,7 @@ struct CurrentPicture {
 /// a reference or still waiting to be output.
 #[derive(Clone)]
 struct Handle {
-	surface: Rc<PooledSurface>,
+	surface: Arc<PooledSurface>,
 	timestamp: u64,
 	width: u32,
 	height: u32,
@@ -1105,7 +1122,7 @@ struct Sequence {
 	width: u32,
 	/// Visible height after cropping.
 	height: u32,
-	pool: Rc<SurfacePool>,
+	pool: SurfacePool,
 	// Drop order: the context must go before the config it was created from.
 	context: Rc<Context>,
 	_config: VaConfig,
@@ -1135,16 +1152,25 @@ impl Sequence {
 			info.max_dpb_frames
 		);
 
+		// What the decoder itself can need at once: a full DPB plus the picture
+		// being decoded. Anything free beyond that was let go by a consumer that
+		// had been holding pictures, and is memory the stream will not ask for
+		// again.
+		let capacity = info.max_dpb_frames + 1;
 		Ok(Self {
 			info,
 			width,
 			height,
-			pool: Rc::new(SurfacePool {
+			pool: SurfacePool {
 				display: Arc::clone(display),
 				width: coded_width,
 				height: coded_height,
-				free: RefCell::new(Vec::new()),
-			}),
+				free: Arc::new(FreeList {
+					surfaces: Mutex::new(Vec::new()),
+					capacity,
+				}),
+				allocated: Cell::new(0),
+			},
 			context,
 			_config: config,
 		})
@@ -1153,22 +1179,41 @@ impl Sequence {
 
 /// A recycling pool of decode target surfaces.
 ///
-/// Surfaces are allocated on demand and returned when the last handle referring
-/// to one drops. The DPB bounds how many can be in flight at once, so the pool
-/// stops growing on its own after the first few pictures.
+/// Surfaces are allocated on demand and come back when the last reference to
+/// one drops: the DPB's, and an [`ExportedFrame`]'s if the picture was handed
+/// out. So a picture a consumer holds is never decoded over, and one it has let
+/// go of is decoded into again rather than replaced by a fresh allocation.
+///
+/// The pool keeps at most [`FreeList::capacity`] surfaces free and destroys
+/// any returned past that, so a consumer that held many pictures and then let
+/// them all go does not leave that many parked here for the rest of the
+/// sequence.
 struct SurfacePool {
 	display: Arc<Display>,
 	width: u32,
 	height: u32,
-	free: RefCell<Vec<Arc<Surface<()>>>>,
+	/// Shared with every surface on loan, which puts itself back from whichever
+	/// thread drops it last.
+	free: Arc<FreeList>,
+	/// Surfaces allocated over the pool's life.
+	allocated: Cell<usize>,
+}
+
+/// The surfaces a [`SurfacePool`] has free to decode into.
+struct FreeList {
+	surfaces: Mutex<Vec<Surface<()>>>,
+	/// The most surfaces kept; one returned past this is destroyed.
+	capacity: usize,
 }
 
 impl SurfacePool {
-	fn alloc(self: &Rc<Self>) -> anyhow::Result<PooledSurface> {
-		let surface = match self.free.borrow_mut().pop() {
+	fn alloc(&self) -> anyhow::Result<PooledSurface> {
+		let recycled = self.free.surfaces.lock().expect("poisoned").pop();
+		let surface = match recycled {
 			Some(surface) => surface,
-			None => Arc::new(
-				self.display
+			None => {
+				let surface = self
+					.display
 					.create_surfaces::<()>(
 						VA_RT_FORMAT_YUV420,
 						Some(VA_FOURCC_NV12),
@@ -1179,76 +1224,75 @@ impl SurfacePool {
 					)
 					.map_err(|e| anyhow!("create decode surface: {e:?}"))?
 					.pop()
-					.context("VA-API returned an empty surface list")?,
-			),
+					.context("VA-API returned an empty surface list")?;
+				self.allocated.set(self.allocated.get() + 1);
+				log::debug!(
+					"allocated decode surface {} at {}x{}",
+					self.allocated.get(),
+					self.width,
+					self.height
+				);
+				surface
+			}
 		};
 
 		Ok(PooledSurface {
 			surface: Some(surface),
-			pool: Rc::clone(self),
-			retired: Cell::new(false),
+			free: Arc::downgrade(&self.free),
 		})
 	}
 }
 
 /// A surface on loan from a [`SurfacePool`], returned to it on drop.
 ///
-/// The surface sits behind an [`Arc`] so that an export can hold one of its own:
-/// see [`PooledSurface::retain`].
+/// Shared behind an [`Arc`] by the DPB and by an [`ExportedFrame`], so it goes
+/// back only once neither refers to it. The pool is held weakly: a surface that
+/// outlives its sequence is destroyed rather than kept for a size nobody
+/// decodes at any more.
 struct PooledSurface {
 	/// Always `Some` until dropped; the `Option` is only there so [`Drop`] can
 	/// move the surface back into the pool.
-	surface: Option<Arc<Surface<()>>>,
-	pool: Rc<SurfacePool>,
-	/// Set once this surface's allocation has been handed out as a DRM PRIME
-	/// descriptor. Recycling it then would have the decoder draw its next
-	/// picture over pixels the consumer is still reading.
-	retired: Cell<bool>,
+	surface: Option<Surface<()>>,
+	/// Where to return the surface. Empty for a surface that came from
+	/// somewhere other than a pool, which is destroyed on drop.
+	free: Weak<FreeList>,
 }
 
 impl PooledSurface {
-	fn get(&self) -> &Arc<Surface<()>> {
+	/// Wraps a surface that belongs to no pool.
+	fn unpooled(surface: Surface<()>) -> Self {
+		Self {
+			surface: Some(surface),
+			free: Weak::new(),
+		}
+	}
+
+	fn get(&self) -> &Surface<()> {
 		self.surface.as_ref().expect("surface is taken only on drop")
 	}
 
 	fn id(&self) -> bindings::VASurfaceID {
 		self.get().id()
 	}
-
-	/// Retires this surface from the pool and hands out a reference to it.
-	///
-	/// Retiring is what keeps the pixels still: a recycled allocation would have
-	/// the decoder draw its next picture over the one whose descriptor the caller
-	/// holds. Handing the surface out alongside that descriptor is what lets the
-	/// caller still read the picture back with `vaDeriveImage`, since the
-	/// exported file descriptor keeps the memory alive but names no surface to
-	/// map.
-	fn retain(&self) -> Arc<Surface<()>> {
-		self.retired.set(true);
-		Arc::clone(self.get())
-	}
 }
 
 impl Drop for PooledSurface {
 	fn drop(&mut self) {
-		if let Some(surface) = self.surface.take() {
-			// A retired surface is not recycled. Its `Arc` is held by whatever
-			// [`PooledSurface::retain`] handed it to, so libva keeps its
-			// reference on the allocation until that drops too; an unretired one
-			// has a reference count of one and goes back to the pool.
-			if !self.retired.get() {
-				self.pool.free.borrow_mut().push(surface);
-			}
+		let (Some(surface), Some(free)) = (self.surface.take(), self.free.upgrade()) else {
+			return;
+		};
+		let mut surfaces = free.surfaces.lock().expect("poisoned");
+		if surfaces.len() < free.capacity {
+			surfaces.push(surface);
 		}
 	}
 }
 
 /// Exports a decoded surface as a DRM PRIME descriptor, copying nothing.
 ///
-/// The surface is retired from the pool on the way out: the descriptor refers to
-/// the same allocation, so recycling it would have a later picture overwrite one
-/// the caller still holds. It travels with the descriptor rather than being
-/// destroyed, so [`ExportedFrame::download`] can still map it.
+/// The frame holds a reference to the surface, so the pool does not hand it out
+/// again while the caller holds the descriptor, and [`ExportedFrame::download`]
+/// can still map it.
 fn export(handle: &Handle) -> anyhow::Result<ExportedFrame> {
 	let surface = handle.surface.get();
 	surface.sync().map_err(|e| anyhow!("surface sync: {e:?}"))?;
@@ -1262,7 +1306,7 @@ fn export(handle: &Handle) -> anyhow::Result<ExportedFrame> {
 		width: handle.width,
 		height: handle.height,
 		descriptor,
-		surface: handle.surface.retain(),
+		surface: Arc::clone(&handle.surface),
 	})
 }
 
@@ -1366,8 +1410,13 @@ fn copy_plane(
 	Ok(())
 }
 
-/// Fails unless the driver can decode H.264 at some profile we can drive.
-fn probe_decode_entrypoint(display: &Display) -> anyhow::Result<()> {
+/// Checks that `display`'s driver can decode H.264, which is what [`Decoder::new`] needs of a render node.
+///
+/// # Errors
+///
+/// Fails unless the driver offers `VAEntrypointVLD` for a Constrained
+/// Baseline, Main, or High profile, or when it cannot be asked.
+pub fn probe(display: &Display) -> anyhow::Result<()> {
 	let profiles = display
 		.query_config_profiles()
 		.map_err(|e| anyhow!("query VA profiles: {e:?}"))?;
@@ -1822,11 +1871,11 @@ mod tests {
 		data
 	}
 
-	/// Exported pictures never share a surface.
+	/// Exported pictures the caller still holds never share a surface.
 	///
-	/// The invariant `export` exists to keep: an exported surface is retired
-	/// from the pool, because recycling it would have a later picture decoded
-	/// over pixels the caller still holds a descriptor for. Two pictures coming
+	/// The invariant `export` exists to keep: a held surface stays out of the
+	/// pool, because recycling it would have a later picture decoded over pixels
+	/// the caller still holds a descriptor for. Two pictures coming
 	/// back with the same modifier and layout is expected; two coming back on
 	/// the same allocation is the bug. The modifier itself is hardware policy,
 	/// so it is printed rather than asserted.
@@ -1870,7 +1919,7 @@ mod tests {
 			assert_eq!(frame.descriptor.layers[0].num_planes, 2, "NV12 is two planes");
 
 			// Two live descriptors for one allocation would mean the pool handed
-			// a retired surface back out. The inode behind a DMA-BUF names the
+			// a held surface back out. The inode behind a DMA-BUF names the
 			// buffer, and is what identifies one allocation from another.
 			let inode = inode(&frame.descriptor.objects[0].fd);
 			assert!(
@@ -1879,6 +1928,23 @@ mod tests {
 			);
 			seen.push(inode);
 		}
+	}
+
+	/// With no node named, the decoder opens one that decodes H.264. A named
+	/// node is used or refused, never swapped for another.
+	#[test]
+	fn the_render_node_is_found_or_named() {
+		if let Err(err) = Decoder::new(Config::new()) {
+			eprintln!("skipping: no VA-API H.264 decoder: {err:#}");
+			return;
+		}
+		let named = Config {
+			device: Some(PathBuf::from("/dev/null")),
+		};
+		assert!(
+			Decoder::new(named).is_err(),
+			"a named node that is not a render node was swapped for one that is"
+		);
 	}
 
 	/// Every picture fed in comes back out, the last of them only on flush.
@@ -1931,6 +1997,110 @@ mod tests {
 		assert!(decoder.flush().expect("flush an empty decoder").is_empty());
 	}
 
+	/// A picture the consumer has let go of is decoded into again rather than
+	/// replaced by a new allocation, and the recycled surfaces still carry the
+	/// right pictures.
+	///
+	/// Each picture is read back and dropped before the next access unit goes
+	/// in, the way a renderer that draws a picture and moves on behaves. Without
+	/// recycling this allocated one surface per picture.
+	#[test]
+	fn a_dropped_export_is_decoded_into_again() {
+		const PICTURES: u32 = 60;
+		let (width, height) = (320u32, 240u32);
+		let Ok(mut encoder) = crate::encode::Encoder::new(encoder_config(width, height)) else {
+			eprintln!("skipping: no VA-API H.264 encoder");
+			return;
+		};
+		let Ok(mut exporting) = Decoder::new(Config::new()) else {
+			eprintln!("skipping: no VA-API H.264 decoder");
+			return;
+		};
+		let mut downloading = Decoder::new(Config::new()).expect("a second decoder");
+
+		let mut compared = 0;
+		for step in 0..PICTURES {
+			let unit = encoder
+				.encode_nv12(&nv12_frame(width, height, step), step == 0)
+				.expect("encode a picture");
+			let exported = exporting
+				.decode_exported(&unit, step as u64)
+				.expect("decode to a descriptor");
+			let downloaded = downloading.decode(&unit, step as u64).expect("decode to client memory");
+			assert_eq!(exported.len(), downloaded.len(), "the two decoders disagreed");
+			for (gpu, cpu) in exported.iter().zip(&downloaded) {
+				let read_back = gpu.download().expect("read the exported surface back");
+				assert!(read_back.data == cpu.data, "picture {} came back wrong", gpu.timestamp);
+				compared += 1;
+			}
+		}
+		assert!(compared > 0, "the decoder produced no pictures");
+
+		let pool = &exporting.sequence.as_ref().expect("a sequence").pool;
+		let allocated = pool.allocated.get();
+		eprintln!("{allocated} surfaces allocated for {PICTURES} exported pictures");
+		assert!(
+			allocated <= pool.free.capacity,
+			"{allocated} surfaces for {PICTURES} pictures; a full DPB and the picture in flight need {}",
+			pool.free.capacity
+		);
+	}
+
+	/// A consumer that holds many pictures and then lets them all go leaves at
+	/// most the pool's capacity behind, and the next pictures reuse those.
+	#[test]
+	fn the_pool_keeps_a_bounded_number_of_free_surfaces() {
+		const HELD: u32 = 40;
+		let (width, height) = (320u32, 240u32);
+		let Ok(mut encoder) = crate::encode::Encoder::new(encoder_config(width, height)) else {
+			eprintln!("skipping: no VA-API H.264 encoder");
+			return;
+		};
+		let Ok(mut decoder) = Decoder::new(Config::new()) else {
+			eprintln!("skipping: no VA-API H.264 decoder");
+			return;
+		};
+
+		let mut step = 0;
+		let mut decode = |decoder: &mut Decoder| {
+			let unit = encoder
+				.encode_nv12(&nv12_frame(width, height, step), step == 0)
+				.expect("encode a picture");
+			step += 1;
+			decoder.decode_exported(&unit, step as u64).expect("decode a picture")
+		};
+
+		let mut held = Vec::new();
+		for _ in 0..HELD {
+			held.extend(decode(&mut decoder));
+		}
+		let pool = &decoder.sequence.as_ref().expect("a sequence").pool;
+		let allocated = pool.allocated.get();
+		assert!(
+			allocated >= held.len(),
+			"{} pictures held on {allocated} surfaces",
+			held.len()
+		);
+
+		drop(held);
+		let free = pool.free.surfaces.lock().unwrap().len();
+		assert!(
+			free <= pool.free.capacity,
+			"{free} surfaces left free, more than the capacity of {}",
+			pool.free.capacity
+		);
+
+		for _ in 0..10 {
+			drop(decode(&mut decoder));
+		}
+		let pool = &decoder.sequence.as_ref().expect("a sequence").pool;
+		assert_eq!(
+			pool.allocated.get(),
+			allocated,
+			"pictures after the release did not reuse the free surfaces"
+		);
+	}
+
 	/// An exported picture crosses threads, which is the point of handing one to
 	/// a renderer: the decoder runs on its own thread and the frame outlives it.
 	/// [`Decoder`] is neither [`Send`] nor [`Sync`], so this pins that the export
@@ -1945,7 +2115,7 @@ mod tests {
 	/// downloads.
 	///
 	/// The invariant that lets a GPU-resident frame keep a CPU fallback: the
-	/// surface is retained rather than destroyed, so `vaDeriveImage` still
+	/// surface travels with the descriptor, so `vaDeriveImage` still
 	/// reaches the picture the descriptor points at. One stream through two
 	/// decoders, so both sides see the same pictures in the same order and the
 	/// comparison is exact rather than approximate.

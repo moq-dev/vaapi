@@ -88,7 +88,10 @@ pub struct Config {
 	/// Keyframe interval in frames.
 	pub gop: u32,
 	/// DRM render node to open (e.g. `/dev/dri/renderD128`).
-	pub device: PathBuf,
+	///
+	/// `None`, the default, opens the first node whose driver can encode H.264,
+	/// and [`Encoder::config`] then names the node it picked.
+	pub device: Option<PathBuf>,
 	/// Color space written into the SPS, and the target of a conversion from RGB.
 	///
 	/// Defaults to [`Color::infer`] for the height, which is what a decoder
@@ -104,7 +107,7 @@ impl Config {
 			framerate,
 			bitrate,
 			gop,
-			device: PathBuf::from("/dev/dri/renderD128"),
+			device: None,
 			color: Color::infer(height),
 		}
 	}
@@ -150,9 +153,24 @@ pub struct Encoder {
 }
 
 impl Encoder {
-	pub fn new(config: Config) -> anyhow::Result<Self> {
-		let display = Display::open_drm_display(&config.device)
-			.map_err(|e| anyhow::anyhow!("open DRM display {:?}: {e:?}", config.device))?;
+	/// Opens [`Config::device`], or the first render node that encodes H.264, and sets up an encode session for `config`.
+	///
+	/// # Errors
+	///
+	/// Fails when libva cannot be loaded, when the named node cannot be opened
+	/// or does not encode H.264 (a named node is never swapped for another), when
+	/// no node encodes H.264, and when the driver refuses the session.
+	pub fn new(mut config: Config) -> anyhow::Result<Self> {
+		let (device, display) = match config.device.take() {
+			Some(device) => {
+				let display = Display::open_drm_display(&device)
+					.map_err(|e| anyhow::anyhow!("open DRM display {device:?}: {e:?}"))?;
+				(device, display)
+			}
+			None => {
+				crate::display::open_first(probe).map_err(|e| e.context("find a render node that encodes H.264"))?
+			}
+		};
 
 		let entrypoint = encode_entrypoint(&display)?;
 		let mut attrs = vec![
@@ -198,13 +216,15 @@ impl Encoder {
 		let height_mbs = sps.pic_height_in_map_units_minus1 + 1;
 
 		log::info!(
-			"opened VA-API H.264 encoder: {}x{} @ {}fps, {} bps, low power: {}",
+			"opened VA-API H.264 encoder on {:?}: {}x{} @ {}fps, {} bps, low power: {}",
+			device,
 			config.width,
 			config.height,
 			config.framerate,
 			config.bitrate,
 			entrypoint == VAEntrypoint::VAEntrypointEncSliceLP,
 		);
+		config.device = Some(device);
 		Ok(Self {
 			config,
 			sps,
@@ -335,7 +355,7 @@ impl Encoder {
 		Ok(())
 	}
 
-	/// Returns the configuration in effect, including a bitrate changed since opening.
+	/// Returns the configuration in effect, including a bitrate changed since opening and the render node picked when none was named.
 	pub fn config(&self) -> &Config {
 		&self.config
 	}
@@ -481,6 +501,16 @@ impl Encoder {
 		}
 		Ok(out)
 	}
+}
+
+/// Checks that `display`'s driver can encode H.264, which is what [`Encoder::new`] needs of a render node.
+///
+/// # Errors
+///
+/// Fails when the driver offers neither the full nor the low-power H.264 Main
+/// encode entrypoint, or cannot be asked.
+pub fn probe(display: &Display) -> anyhow::Result<()> {
+	encode_entrypoint(display).map(drop)
 }
 
 /// Returns the entrypoint to encode H.264 Main with: the full one, or the low-power one where it is all there is.
@@ -1043,6 +1073,25 @@ mod tests {
 		let surface = surface_with(display, VA_FOURCC_NV12, VA_RT_FORMAT_YUV420, (width, height), |_, _| {});
 		upload_nv12(display, &surface, width, height, &nv12_frame(width, height, step)).expect("upload");
 		DmaBuf::from_prime(surface.export_prime().expect("export the surface")).expect("one object")
+	}
+
+	/// With no node named, the encoder opens one that encodes H.264 and records
+	/// which. A named node is used or refused, never swapped for another.
+	#[test]
+	fn the_render_node_is_found_or_named() {
+		let Some(encoder) = encoder(config()) else { return };
+		let device = encoder.config().device.clone().expect("the picked node is recorded");
+		let display = Display::open_drm_display(&device).expect("reopen the picked node");
+		probe(&display).expect("the picked node encodes H.264");
+
+		let named = Config {
+			device: Some(PathBuf::from("/dev/null")),
+			..config()
+		};
+		assert!(
+			Encoder::new(named).is_err(),
+			"a named node that is not a render node was swapped for one that is"
+		);
 	}
 
 	/// CPU NV12 in, H.264 out that an independent decoder reads back as the same picture.

@@ -46,18 +46,43 @@ impl Iterator for DrmDeviceIterator {
 	type Item = PathBuf;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		match self.cur_idx {
-			idx if idx >= DRM_RENDER_NODE_START + DRM_NUM_NODES => None,
-			idx => {
-				let path = PathBuf::from(format!("{}{}", DRM_NODE_DEFAULT_PREFIX, idx));
-				if !path.exists() {
-					None
-				} else {
-					self.cur_idx += 1;
-					Some(path)
-				}
+		// Skips a missing node rather than stopping at it: numbering follows the
+		// order devices probed in, and a device that has been unbound leaves a gap.
+		while self.cur_idx < DRM_RENDER_NODE_START + DRM_NUM_NODES {
+			let path = PathBuf::from(format!("{}{}", DRM_NODE_DEFAULT_PREFIX, self.cur_idx));
+			self.cur_idx += 1;
+			if path.exists() {
+				return Some(path);
 			}
 		}
+		None
+	}
+}
+
+/// Opens the first render node whose driver passes `probe`, returning the node with its display.
+///
+/// A machine with more than one GPU numbers its render nodes in probe order,
+/// so the one a caller needs is not reliably `renderD128`: on a laptop with an
+/// NVIDIA and an Intel GPU, either can come first, and only one may offer the
+/// entrypoint the caller wants.
+///
+/// # Errors
+///
+/// Fails when no node passes, naming each node tried and why it was passed over.
+pub(crate) fn open_first(probe: impl Fn(&Display) -> anyhow::Result<()>) -> anyhow::Result<(PathBuf, Arc<Display>)> {
+	let mut refused = Vec::new();
+	for node in DrmDeviceIterator::default() {
+		let opened = Display::open_drm_display(&node)
+			.map_err(anyhow::Error::from)
+			.and_then(|display| probe(&display).map(|()| display));
+		match opened {
+			Ok(display) => return Ok((node, display)),
+			Err(err) => refused.push(format!("{}: {err:#}", node.display())),
+		}
+	}
+	match refused.is_empty() {
+		true => anyhow::bail!("no DRM render node under {DRM_NODE_DEFAULT_PREFIX}*"),
+		false => anyhow::bail!("no DRM render node qualifies ({})", refused.join("; ")),
 	}
 }
 

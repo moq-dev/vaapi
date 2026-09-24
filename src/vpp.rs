@@ -42,6 +42,21 @@ use crate::{
 	VAEntrypoint, VAProfile,
 };
 
+/// Checks that `display`'s driver offers video post-processing, which is what [`Processor::with_display`] needs of a render node.
+///
+/// # Errors
+///
+/// Fails when the driver has no `VAEntrypointVideoProc`, or cannot be asked.
+pub fn probe(display: &Display) -> anyhow::Result<()> {
+	let entrypoints = display
+		.query_config_entrypoints(VAProfile::VAProfileNone)
+		.map_err(|e| anyhow::anyhow!("query video processing entrypoints: {e:?}"))?;
+	match entrypoints.contains(&VAEntrypoint::VAEntrypointVideoProc) {
+		true => Ok(()),
+		false => anyhow::bail!("the driver has no video post-processing entrypoint"),
+	}
+}
+
 /// A video post-processor on one device.
 ///
 /// Holds the display, the VPP configuration, and one processing context per
@@ -74,12 +89,9 @@ impl Processor {
 	/// which GPU should use. A machine with more than one wants
 	/// [`Processor::new`] or [`Processor::with_display`] instead.
 	pub fn open() -> anyhow::Result<Self> {
-		for device in crate::DrmDeviceIterator::default() {
-			if let Ok(processor) = Self::new(&device) {
-				return Ok(processor);
-			}
-		}
-		Err(anyhow::anyhow!("no DRM device supports video post-processing"))
+		let (_, display) =
+			crate::display::open_first(probe).map_err(|e| e.context("find a render node that post-processes video"))?;
+		Self::with_display(display)
 	}
 
 	/// Configures an already open display for video post-processing.
