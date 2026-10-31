@@ -19,6 +19,8 @@ check:
 ci:
     just check
     cargo test --lib
+    # A consumer must be able to choose its own release logging level.
+    cargo check --lib --features log/release_max_level_trace
     cargo deny check --show-stats
 
 # Auto-fix clippy + formatting.

@@ -48,12 +48,41 @@ pulled in as a git dependency.
   [`libva/`](./libva) (see `just vendor`) and fed to bindgen, so generating the
   bindings needs **no system libva-dev** — only `libclang` — and the pinned
   version means a system libva bump can't drift the bindings.
-- **Links system libva on Linux.** The generated `va*` symbols are resolved by
-  linking the system `libva` / `libva-drm` (via pkg-config), so a `vaapi`-enabled
-  binary requires `libva.so` present at runtime — fine for a build that targets
-  VA-API hardware. VA-API's ABI is stable, so a newer system libva links against
-  the pinned bindings. (On non-Linux hosts the crate only builds as an rlib, which
-  leaves the symbols for the final binary, so it stays compilable for development.)
+- **Loads system libva at runtime on Linux.** The generated `Va` function table
+  loads `libva` / `libva-drm` with `libloading`. Building needs no system libva,
+  and a binary can start without it; opening a display reports a missing driver
+  or library. The crate also compiles on non-Linux hosts for development.
+
+## Upstream
+
+Last checked **2026-10-31**, starting from the Discord vendor baselines:
+
+| Source | Vendored baseline | ChromeOS default branch checked |
+| --- | --- | --- |
+| cros-libva | [`discord-0.0.13`, `896a248e`](https://github.com/discord/cros-libva/commit/896a248e003caae7a7120812f7eaa423c93a920d) | [`59384456ac2ae78c0c3e5515f41ef1efd9b802cf`](https://github.com/chromeos/cros-libva/commit/59384456ac2ae78c0c3e5515f41ef1efd9b802cf) |
+| cros-codecs | [`discord-0.0.5`, `9cdecb19`](https://github.com/discord/cros-codecs/commit/9cdecb192ee3682950d02bd80a7f106163531b76) | [`a050c6cde530e563197ee9e3e72ab01f48a0c41f`](https://github.com/chromeos/cros-codecs/commit/a050c6cde530e563197ee9e3e72ab01f48a0c41f) |
+
+The forks diverge, so compare commits reachable from the checked head but not
+the baseline, rather than replacing Discord's additions with the upstream tree.
+This run checked all five cros-libva commits and the one cros-codecs commit:
+
+| Commit | Disposition |
+| --- | --- |
+| cros-libva [`838808ce`](https://github.com/chromeos/cros-libva/commit/838808cebfeff64f5c3543c873dbc604857b3702), protected-content headers | Not needed: no protected-content consumer or Android build in this crate. |
+| cros-libva [`89454d66`](https://github.com/chromeos/cros-libva/commit/89454d660411627a4a463116fdea00ac1ac888bc), explicit image lifetimes | Already present in `Image::create_from` and `Picture::{derive_image,create_image}`. |
+| cros-libva [`9f3c0d92`](https://github.com/chromeos/cros-libva/commit/9f3c0d9264ec04b4fa792764178b879341ce33b1), packed-header bindings | Already present in `bindgen_gen.rs`, `buffer.rs`, and the H.264 encoder. |
+| cros-libva [`ed9c63b7`](https://github.com/chromeos/cros-libva/commit/ed9c63b743ce9490e1079a8b0c1a24b8e879324f), borrowed input buffers | Optional copy avoidance, not a correctness fix. Keep the existing owned-buffer API; no new public API or optimization without measurement. |
+| cros-libva [`59384456`](https://github.com/chromeos/cros-libva/commit/59384456ac2ae78c0c3e5515f41ef1efd9b802cf), libva 2.23 VP9 fields | Build compatibility already covered by `..Default::default()` in the retained VP9 wrapper against pinned 2.23 headers. The codec drivers support H.264 only, so no VP9 segmentation control is needed. |
+| cros-codecs [`a050c6cd`](https://github.com/chromeos/cros-codecs/commit/a050c6cde530e563197ee9e3e72ab01f48a0c41f), release log filtering | Ported: remove `log/release_max_level_debug`, which conflicts with a consumer selecting another release level. `just ci` checks feature unification with `log/release_max_level_trace`. |
+
+GitHub's published security-advisory endpoints for
+[chromeos/cros-libva](https://github.com/chromeos/cros-libva/security/advisories),
+[chromeos/cros-codecs](https://github.com/chromeos/cros-codecs/security/advisories),
+[discord/cros-libva](https://github.com/discord/cros-libva/security/advisories), and
+[discord/cros-codecs](https://github.com/discord/cros-codecs/security/advisories)
+all returned empty lists on this date. GitHub's global Rust advisory queries for
+`cros-libva` and `cros-codecs` also returned none. This records the published
+advisories checked, not a guarantee that no undisclosed vulnerabilities exist.
 
 ## Layout
 
@@ -74,8 +103,8 @@ nix develop --command just ci        # check + cargo-deny
 nix develop --command just vendor    # refresh libva/ headers from upstream
 ```
 
-The crate compiles on any OS (macOS included) — the rlib build is header-only and
-defers the libva link to the final binary, which is Linux-only.
+The crate compiles on any OS (macOS included); libva is loaded only when used on
+Linux, with no link-time dependency.
 
 ## Licensing
 
