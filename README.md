@@ -51,7 +51,7 @@ pulled in as a git dependency.
 - **Loads system libva at runtime on Linux.** The generated `Va` function table
   loads `libva` / `libva-drm` with `libloading`. Building needs no system libva,
   and a binary can start without it; opening a display reports a missing driver
-  or library. The crate also compiles on non-Linux hosts for development.
+  or library. The crate also compiles on macOS for development.
 
 ## Upstream
 
@@ -103,8 +103,8 @@ nix develop --command just ci        # check + cargo-deny
 nix develop --command just vendor    # refresh libva/ headers from upstream
 ```
 
-The crate compiles on any OS (macOS included); libva is loaded only when used on
-Linux, with no link-time dependency.
+The crate compiles on macOS for development, with no link-time dependency on
+libva.
 
 ## Licensing
 
