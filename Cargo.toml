@@ -26,7 +26,7 @@ exclude = ["flake.nix", "flake.lock", "justfile", "deny.toml", "rust-toolchain.t
 anyhow = "1"
 thiserror = "1"
 bitflags = "2.5"
-log = { version = "0", features = ["release_max_level_debug"] }
+log = "0"
 # Runtime dlopen of libva; the bindgen `Va` struct is built on libloading::Library.
 libloading = "0.8"
 
