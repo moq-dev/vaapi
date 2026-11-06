@@ -21,6 +21,7 @@ mod display;
 mod generic_value;
 mod image;
 mod picture;
+mod pool;
 mod surface;
 mod usage_hint;
 

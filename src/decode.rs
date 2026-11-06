@@ -32,11 +32,10 @@
 //! stream this crate's encoder, WebRTC, or a browser's `VideoEncoder` produces.
 //! Left and top cropping are rejected; right and bottom cropping are supported.
 
-use std::cell::Cell;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context as _};
 
@@ -46,6 +45,7 @@ use crate::codec::h264::parser::{
 	SliceType, Sps,
 };
 use crate::codec::h264::picture::{Field, IsIdr, PictureData, Reference};
+use crate::pool::{PooledSurface, SurfacePool};
 use crate::{
 	bindings, Buffer, BufferType, Config as VaConfig, Context, Display, DrmPrimeSurfaceDescriptor, H264PicFields,
 	H264SeqFields, IQMatrix, IQMatrixBufferH264, Image, Picture, PictureH264, PictureParameter,
@@ -146,9 +146,23 @@ impl ExportedFrame {
 	/// Fails when the surface is not NV12, cannot be synced, or the driver will
 	/// not export it.
 	pub fn from_surface(surface: Surface<()>, timestamp: u64) -> anyhow::Result<Self> {
-		surface.sync().map_err(|e| anyhow!("surface sync: {e:?}"))?;
-		let (width, height) = surface.size();
+		let size = surface.size();
+		Self::export(Arc::new(PooledSurface::unpooled(surface)), timestamp, size)
+	}
+
+	/// Exports `surface`, whose picture is the top-left `width` by `height` of it, copying nothing.
+	///
+	/// The frame holds a reference to the surface, so a pool does not hand it
+	/// out again while the caller holds the descriptor, and
+	/// [`download`](Self::download) can still map it.
+	pub(crate) fn export(
+		surface: Arc<PooledSurface>,
+		timestamp: u64,
+		(width, height): (u32, u32),
+	) -> anyhow::Result<Self> {
+		surface.get().sync().map_err(|e| anyhow!("surface sync: {e:?}"))?;
 		let descriptor = surface
+			.get()
 			.export_prime()
 			.map_err(|e| anyhow!("export the surface: {e:?}"))?;
 		if descriptor.fourcc != VA_FOURCC_NV12 {
@@ -159,7 +173,7 @@ impl ExportedFrame {
 			width,
 			height,
 			descriptor,
-			surface: Arc::new(PooledSurface::unpooled(surface)),
+			surface,
 		})
 	}
 
@@ -1161,153 +1175,25 @@ impl Sequence {
 			info,
 			width,
 			height,
-			pool: SurfacePool {
-				display: Arc::clone(display),
-				width: coded_width,
-				height: coded_height,
-				free: Arc::new(FreeList {
-					surfaces: Mutex::new(Vec::new()),
-					capacity,
-				}),
-				allocated: Cell::new(0),
-			},
+			pool: SurfacePool::new(
+				display,
+				(coded_width, coded_height),
+				UsageHint::USAGE_HINT_DECODER,
+				capacity,
+			),
 			context,
 			_config: config,
 		})
 	}
 }
 
-/// A recycling pool of decode target surfaces.
-///
-/// Surfaces are allocated on demand and come back when the last reference to
-/// one drops: the DPB's, and an [`ExportedFrame`]'s if the picture was handed
-/// out. So a picture a consumer holds is never decoded over, and one it has let
-/// go of is decoded into again rather than replaced by a fresh allocation.
-///
-/// The pool keeps at most [`FreeList::capacity`] surfaces free and destroys
-/// any returned past that, so a consumer that held many pictures and then let
-/// them all go does not leave that many parked here for the rest of the
-/// sequence.
-struct SurfacePool {
-	display: Arc<Display>,
-	width: u32,
-	height: u32,
-	/// Shared with every surface on loan, which puts itself back from whichever
-	/// thread drops it last.
-	free: Arc<FreeList>,
-	/// Surfaces allocated over the pool's life.
-	allocated: Cell<usize>,
-}
-
-/// The surfaces a [`SurfacePool`] has free to decode into.
-struct FreeList {
-	surfaces: Mutex<Vec<Surface<()>>>,
-	/// The most surfaces kept; one returned past this is destroyed.
-	capacity: usize,
-}
-
-impl SurfacePool {
-	fn alloc(&self) -> anyhow::Result<PooledSurface> {
-		let recycled = self.free.surfaces.lock().expect("poisoned").pop();
-		let surface = match recycled {
-			Some(surface) => surface,
-			None => {
-				let surface = self
-					.display
-					.create_surfaces::<()>(
-						VA_RT_FORMAT_YUV420,
-						Some(VA_FOURCC_NV12),
-						self.width,
-						self.height,
-						Some(UsageHint::USAGE_HINT_DECODER),
-						vec![()],
-					)
-					.map_err(|e| anyhow!("create decode surface: {e:?}"))?
-					.pop()
-					.context("VA-API returned an empty surface list")?;
-				self.allocated.set(self.allocated.get() + 1);
-				log::debug!(
-					"allocated decode surface {} at {}x{}",
-					self.allocated.get(),
-					self.width,
-					self.height
-				);
-				surface
-			}
-		};
-
-		Ok(PooledSurface {
-			surface: Some(surface),
-			free: Arc::downgrade(&self.free),
-		})
-	}
-}
-
-/// A surface on loan from a [`SurfacePool`], returned to it on drop.
-///
-/// Shared behind an [`Arc`] by the DPB and by an [`ExportedFrame`], so it goes
-/// back only once neither refers to it. The pool is held weakly: a surface that
-/// outlives its sequence is destroyed rather than kept for a size nobody
-/// decodes at any more.
-struct PooledSurface {
-	/// Always `Some` until dropped; the `Option` is only there so [`Drop`] can
-	/// move the surface back into the pool.
-	surface: Option<Surface<()>>,
-	/// Where to return the surface. Empty for a surface that came from
-	/// somewhere other than a pool, which is destroyed on drop.
-	free: Weak<FreeList>,
-}
-
-impl PooledSurface {
-	/// Wraps a surface that belongs to no pool.
-	fn unpooled(surface: Surface<()>) -> Self {
-		Self {
-			surface: Some(surface),
-			free: Weak::new(),
-		}
-	}
-
-	fn get(&self) -> &Surface<()> {
-		self.surface.as_ref().expect("surface is taken only on drop")
-	}
-
-	fn id(&self) -> bindings::VASurfaceID {
-		self.get().id()
-	}
-}
-
-impl Drop for PooledSurface {
-	fn drop(&mut self) {
-		let (Some(surface), Some(free)) = (self.surface.take(), self.free.upgrade()) else {
-			return;
-		};
-		let mut surfaces = free.surfaces.lock().expect("poisoned");
-		if surfaces.len() < free.capacity {
-			surfaces.push(surface);
-		}
-	}
-}
-
 /// Exports a decoded surface as a DRM PRIME descriptor, copying nothing.
-///
-/// The frame holds a reference to the surface, so the pool does not hand it out
-/// again while the caller holds the descriptor, and [`ExportedFrame::download`]
-/// can still map it.
 fn export(handle: &Handle) -> anyhow::Result<ExportedFrame> {
-	let surface = handle.surface.get();
-	surface.sync().map_err(|e| anyhow!("surface sync: {e:?}"))?;
-
-	let descriptor = surface
-		.export_prime()
-		.map_err(|e| anyhow!("export the decode surface: {e:?}"))?;
-
-	Ok(ExportedFrame {
-		timestamp: handle.timestamp,
-		width: handle.width,
-		height: handle.height,
-		descriptor,
-		surface: Arc::clone(&handle.surface),
-	})
+	ExportedFrame::export(
+		Arc::clone(&handle.surface),
+		handle.timestamp,
+		(handle.width, handle.height),
+	)
 }
 
 /// Reads a decoded surface back to client memory as tightly packed NV12.
