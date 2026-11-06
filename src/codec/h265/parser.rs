@@ -4006,7 +4006,7 @@ impl Parser {
 			let max = if !pps.tiles_enabled_flag && pps.entropy_coding_sync_enabled_flag {
 				sps.pic_height_in_ctbs_y - 1
 			} else if pps.tiles_enabled_flag && !pps.entropy_coding_sync_enabled_flag {
-				u32::from((pps.num_tile_columns_minus1 + 1) * (pps.num_tile_rows_minus1 + 1) - 1)
+				(u32::from(pps.num_tile_columns_minus1) + 1) * (u32::from(pps.num_tile_rows_minus1) + 1) - 1
 			} else {
 				(u32::from(pps.num_tile_columns_minus1) + 1) * sps.pic_height_in_ctbs_y - 1
 			};
