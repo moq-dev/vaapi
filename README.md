@@ -46,14 +46,21 @@ pulled in as a git dependency.
   through `VAEntrypointVideoProc`, scaling, converting, and re-tiling on the
   way. `Processor::resize` scales into NV12 surfaces it recycles per size, so a
   stream of resizes costs no allocation per frame.
-- **H.264 decode** over VA-API: one Annex-B access unit in, tightly-packed NV12
-  out, with in-stream parameter sets, a conformant DPB (reference marking,
-  reordering, frame_num gaps), and mid-stream resolution changes. Progressive
-  8-bit 4:2:0 only, with right/bottom cropping supported and left/top cropping
-  rejected. Verified bit-exact against ffmpeg's software decoder on Intel
+- **H.264 and H.265 decode** over VA-API: one Annex-B access unit in,
+  tightly-packed NV12 out, with in-stream parameter sets, a conformant DPB, and
+  mid-stream resolution changes. H.264 covers reference marking, reordering,
+  and frame_num gaps; H.265 covers reference picture sets, long-term
+  references, open-GOP CRA pictures, and dependent slice segments, and puts a
+  picture out as soon as the SPS's reorder limit allows, so a stream without
+  B-frames comes out with no delay. H.265 is the Main profile, plus Main 10 and
+  Main Still Picture streams that hold 8-bit samples. Progressive 8-bit 4:2:0
+  only, with right/bottom cropping supported and left/top cropping rejected.
+  H.264 was verified bit-exact against ffmpeg's software decoder on Intel
   Meteor Lake (iHD 26.1.5) for constrained baseline, main with B-frames, high at
-  720p, and a cropped non-macroblock-aligned size. The main-with-B-frames case
-  runs as a test wherever ffmpeg and a VA-API device are both present.
+  720p, and a cropped non-macroblock-aligned size. Both codecs, coded by x264
+  and x265 with B-frames at 320x240 and cropped at 852x478, run bit-exact as a
+  test wherever ffmpeg and a VA-API device are both present, and pass on Intel
+  Arrow Lake (iHD 26.1.2) and AMD Radeon RX 9070 (radeonsi, Mesa 26.0.8).
 - **Checked-in bindings from pinned headers.** libva's headers are vendored
   into [`libva/`](./libva) (see `just vendor`), and `just bindgen` generates
   [`src/bindings/libva.rs`](./src/bindings/libva.rs) from them. The output is
@@ -87,7 +94,7 @@ This run checked all five cros-libva commits and the one cros-codecs commit:
 | cros-libva [`89454d66`](https://github.com/chromeos/cros-libva/commit/89454d660411627a4a463116fdea00ac1ac888bc), explicit image lifetimes | Already present in `Image::create_from` and `Picture::{derive_image,create_image}`. |
 | cros-libva [`9f3c0d92`](https://github.com/chromeos/cros-libva/commit/9f3c0d9264ec04b4fa792764178b879341ce33b1), packed-header bindings | Already present in the `bindgen` allowlist, `buffer.rs`, and the H.264 encoder. |
 | cros-libva [`ed9c63b7`](https://github.com/chromeos/cros-libva/commit/ed9c63b743ce9490e1079a8b0c1a24b8e879324f), borrowed input buffers | Optional copy avoidance, not a correctness fix. Keep the existing owned-buffer API; no new public API or optimization without measurement. |
-| cros-libva [`59384456`](https://github.com/chromeos/cros-libva/commit/59384456ac2ae78c0c3e5515f41ef1efd9b802cf), libva 2.23 VP9 fields | Build compatibility already covered by `..Default::default()` in the retained VP9 wrapper against pinned 2.23 headers. The codec drivers support H.264 only, so no VP9 segmentation control is needed. |
+| cros-libva [`59384456`](https://github.com/chromeos/cros-libva/commit/59384456ac2ae78c0c3e5515f41ef1efd9b802cf), libva 2.23 VP9 fields | Build compatibility already covered by `..Default::default()` in the retained VP9 wrapper against pinned 2.23 headers. The codec drivers support only H.264 and H.265, so no VP9 segmentation control is needed. |
 | cros-codecs [`a050c6cd`](https://github.com/chromeos/cros-codecs/commit/a050c6cde530e563197ee9e3e72ab01f48a0c41f), release log filtering | Ported: remove `log/release_max_level_debug`, which conflicts with a consumer selecting another release level. `just ci` checks feature unification with `log/release_max_level_trace`. |
 
 GitHub's published security-advisory endpoints for
@@ -102,8 +109,8 @@ advisories checked, not a guarantee that no undisclosed vulnerabilities exist.
 ## Layout
 
 - `src/` — libva bindings (`bindings`, `display`, `surface`, `buffer`, ...), the
-  H.264 bitstream layer (`bitstream_utils`, `codec::h264`), the H.265 header
-  writer (`encode/h265.rs`), the thin encode
+  H.264 and H.265 bitstream layers (`bitstream_utils`, `codec::h264`,
+  `codec::h265`), the H.265 header writer (`encode/h265.rs`), the thin encode
   and decode drivers (`encode`, `decode`), DMA-BUF import (`dmabuf`), video
   post-processing (`vpp`), and the color space both share (`color`).
 - `libva/` — vendored libva headers (checked in; refreshed by `just vendor`).
