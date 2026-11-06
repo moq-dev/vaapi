@@ -6,7 +6,7 @@
 > it. The encoder and the decoder have both been checked against ffmpeg's
 > software codecs on Intel hardware (see below).
 
-A small, self-contained **VA-API H.264 hardware codec** for Linux (Intel / AMD),
+A small, self-contained **VA-API H.264 / H.265 hardware codec** for Linux (Intel / AMD),
 derived from
 [discord/cros-libva @ discord-0.0.13](https://github.com/discord/cros-libva/tree/discord-0.0.13)
 and
@@ -20,9 +20,13 @@ pulled in as a git dependency.
 
 ## What it does
 
-- **H.264 encode** over VA-API: an Annex-B elementary stream out (packed
-  SPS/PPS + slice headers, low-latency IPPP, CBR rate control whose bitrate can
-  change between frames, the color space labelled in the VUI). Three inputs:
+- **H.264 and H.265 encode** over VA-API: an Annex-B elementary stream out
+  (packed parameter sets, low-latency IPPP, CBR rate control whose bitrate can
+  change between frames, the color space labelled in the VUI). H.265 is Main
+  profile with its VPS, SPS, PPS, and slice headers written here, its coding
+  tools following what the driver reports, and its coded size following the
+  driver's surface alignment, so the crop holds on radeonsi, which rewrites the
+  SPS at that alignment. Three inputs:
   tightly-packed NV12 from the CPU, an NV12 DMA-BUF at the encoder's size
   encoded in place, and any other importable DMA-BUF (packed RGB, YUYV, NV12
   at another size or in another color space) converted and scaled into the
@@ -30,8 +34,13 @@ pulled in as a git dependency.
   formats go through the same video processor call untested.
   Checked on Intel Meteor Lake (iHD 26.1.5) by decoding with ffmpeg: luma
   above 35 dB PSNR against the source, and RGB converted to BT.601 and BT.709
-  to within a few code values. These run as tests wherever ffmpeg and a VA-API
-  device are both present.
+  to within a few code values. These run as tests, for both codecs, wherever
+  ffmpeg and a VA-API device are both present. H.265 passes them on Intel
+  Arrow Lake (iHD 26.1.2). On AMD Radeon RX 9070 (radeonsi, Mesa 26.0.8) it
+  passes all but the color conversion and bitrate checks: chroma converted by
+  the video processor lands about 7 code values off, for either codec, and
+  radeonsi's rate control runs about 4x over 250 kbps on per-frame noise. H.264 encode on that card does not yet
+  produce a decodable stream.
 - **DMA-BUF import and video post-processing.** `dmabuf` wraps a DRM PRIME
   buffer as a surface without copying it; `vpp` blits one surface into another
   through `VAEntrypointVideoProc`, scaling, converting, and re-tiling on the
@@ -93,7 +102,8 @@ advisories checked, not a guarantee that no undisclosed vulnerabilities exist.
 ## Layout
 
 - `src/` — libva bindings (`bindings`, `display`, `surface`, `buffer`, ...), the
-  H.264 bitstream layer (`bitstream_utils`, `codec::h264`), the thin encode
+  H.264 bitstream layer (`bitstream_utils`, `codec::h264`), the H.265 header
+  writer (`encode/h265.rs`), the thin encode
   and decode drivers (`encode`, `decode`), DMA-BUF import (`dmabuf`), video
   post-processing (`vpp`), and the color space both share (`color`).
 - `libva/` — vendored libva headers (checked in; refreshed by `just vendor`).
