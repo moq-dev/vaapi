@@ -85,7 +85,7 @@ const LIMIT: u32 = 2048;
 /// Encoder configuration. Dimensions must be even (4:2:0 chroma).
 #[derive(Clone, Debug)]
 pub struct Config {
-	/// The format to encode, H.264 unless set.
+	/// The format to encode, H.264 unless set. Main profile either way.
 	pub codec: Codec,
 	pub width: u32,
 	pub height: u32,
@@ -215,7 +215,8 @@ impl Encoder {
 	/// Fails when libva cannot be loaded, when the named node cannot be opened
 	/// or does not encode the codec (a named node is never swapped for
 	/// another), when no node encodes it, and when the driver refuses the
-	/// session or, for H.265, requires a coding tool this encoder does not write.
+	/// session or, for H.265, requires a coding tool this encoder does not write
+	/// or takes no packed sequence header.
 	pub fn new(mut config: Config) -> anyhow::Result<Self> {
 		let codec = config.codec;
 		let (device, display) = match config.device.take() {
@@ -244,12 +245,17 @@ impl Encoder {
 		// iHD takes them without being told, and a driver that follows the spec
 		// writes its own unless the config asks. For H.265 it is the VPS, SPS and
 		// PPS as one sequence header, plus each slice header, as ffmpeg packs
-		// them; the driver writes whichever kind it does not take.
+		// them; the driver writes the slice headers if it does not take them.
 		let wanted = match codec {
 			Codec::H264 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE,
 			Codec::H265 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_SLICE,
 		};
 		let packed = packed_headers(&display, codec, entrypoint) & wanted;
+		// VA's H.265 sequence parameters have no conformance window and carry no
+		// VUI here, so an SPS the driver writes would lose the crop and the color.
+		if codec == Codec::H265 && packed & VA_ENC_PACKED_HEADER_SEQUENCE == 0 {
+			anyhow::bail!("the driver takes no packed H.265 sequence header, which the crop and color need");
+		}
 		if packed != 0 {
 			attrs.push(VAConfigAttrib {
 				type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,

@@ -4,8 +4,10 @@
 //! The parameter sets and slice headers are written here and handed to the
 //! driver packed, so it produces only the slice data. That is what ffmpeg's
 //! `hevc_vaapi` does, and the path the Intel and AMD drivers are exercised on.
-//! A driver that does not take one kind of packed header writes that kind
-//! itself, from parameter buffers that describe the same stream.
+//! A driver must take the packed parameter sets, since VA's sequence parameters
+//! cannot carry the conformance window or the VUI; one that does not take
+//! packed slice headers writes them itself, from parameter buffers that
+//! describe the same stream.
 //!
 //! The coding tools follow what the driver reports through
 //! `VAConfigAttribEncHEVCFeatures` and `VAConfigAttribEncHEVCBlockSizes`: a
