@@ -24,6 +24,10 @@ const MAX_VPS_COUNT: usize = 16;
 const MAX_SPS_COUNT: usize = 16;
 // Given the max PPS id.
 const MAX_PPS_COUNT: usize = 64;
+// The most tile columns and rows any level allows (Table A.8), including the
+// last of each, which is inferred rather than signalled.
+const MAX_TILE_COLUMNS: usize = 20;
+const MAX_TILE_ROWS: usize = 22;
 // 7.4.7.1
 const MAX_REF_IDX_ACTIVE: u32 = 15;
 
@@ -1236,10 +1240,10 @@ pub struct Pps {
 	pub uniform_spacing_flag: bool,
 	/// `column_width_minus1[ i ]` plus 1 specifies the width of the i-th tile
 	/// column in units of CTBs.
-	pub column_width_minus1: [u32; 19],
+	pub column_width_minus1: [u32; MAX_TILE_COLUMNS],
 	/// `row_height_minus1[ i ]` plus 1 specifies the height of the i-th tile row
 	/// in units of CTBs.
-	pub row_height_minus1: [u32; 21],
+	pub row_height_minus1: [u32; MAX_TILE_ROWS],
 	/// When set, specifies that in-loop filtering operations may be performed
 	/// across tile boundaries in pictures referring to the PPS.  When not set,
 	/// specifies that in-loop filtering operations are not performed across
@@ -1713,7 +1717,7 @@ pub struct SliceHeader {
 	/// num_entry_point_offsets + 1 subsets, with subset index values ranging
 	/// from 0 to num_entry_point_offsets, inclusive. See the specification for
 	/// more details.
-	pub entry_point_offset_minus1: [u32; 32],
+	pub entry_point_offset_minus1: Vec<u32>,
 	/// Same as NumPicTotalCurr in the specification.
 	pub num_pic_total_curr: u32,
 	// Size of slice_header() in bits.
@@ -1809,7 +1813,7 @@ impl<'a> Slice<'a> {
 			let segment_address = self.header.segment_address;
 
 			let offset_len_minus1 = self.header.offset_len_minus1;
-			let entry_point_offset_minus1 = self.header.entry_point_offset_minus1;
+			let entry_point_offset_minus1 = std::mem::take(&mut self.header.entry_point_offset_minus1);
 			let num_pic_total_curr = self.header.num_pic_total_curr;
 			let header_bit_size = self.header.header_bit_size;
 			let n_emulation_prevention_bytes = self.header.n_emulation_prevention_bytes;
@@ -2453,7 +2457,7 @@ impl Parser {
 		}
 
 		for i in 0..sps_max_sub_layers_minus_1 as usize {
-			if ptl.sub_layer_level_present_flag[i] {
+			if ptl.sub_layer_profile_present_flag[i] {
 				ptl.sub_layer_profile_space[i] = r.read_bits(2)?;
 				ptl.sub_layer_tier_flag[i] = r.read_bit()?;
 				ptl.sub_layer_profile_idc[i] = r.read_bits(5)?;
@@ -2533,11 +2537,11 @@ impl Parser {
 				} else {
 					r.skip_bits(1)?;
 				}
+			}
 
-				if ptl.sub_layer_level_present_flag[i] {
-					let level: u8 = r.read_bits(8)?;
-					ptl.sub_layer_level_idc[i] = Level::try_from(level)?;
-				}
+			if ptl.sub_layer_level_present_flag[i] {
+				let level: u8 = r.read_bits(8)?;
+				ptl.sub_layer_level_idc[i] = Level::try_from(level)?;
 			}
 		}
 		Ok(())
@@ -3431,6 +3435,15 @@ impl Parser {
 		if pps.tiles_enabled_flag {
 			pps.num_tile_columns_minus1 = r.read_ue_max(sps.pic_width_in_ctbs_y - 1)?;
 			pps.num_tile_rows_minus1 = r.read_ue_max(sps.pic_height_in_ctbs_y - 1)?;
+			if usize::from(pps.num_tile_columns_minus1) >= MAX_TILE_COLUMNS
+				|| usize::from(pps.num_tile_rows_minus1) >= MAX_TILE_ROWS
+			{
+				return Err(format!(
+					"{}x{} tiles, more than any level allows",
+					u32::from(pps.num_tile_columns_minus1) + 1,
+					u32::from(pps.num_tile_rows_minus1) + 1
+				));
+			}
 			pps.uniform_spacing_flag = r.read_bit()?;
 			if !pps.uniform_spacing_flag {
 				pps.column_width_minus1[usize::from(pps.num_tile_columns_minus1)] = sps.pic_width_in_ctbs_y - 1;
@@ -4001,10 +4014,12 @@ impl Parser {
 			hdr.num_entry_point_offsets = r.read_ue_max(max)?;
 			if hdr.num_entry_point_offsets > 0 {
 				hdr.offset_len_minus1 = r.read_ue_max(31)?;
-				for i in 0..hdr.num_entry_point_offsets as usize {
-					let num_bits = usize::from(hdr.offset_len_minus1 + 1);
-					hdr.entry_point_offset_minus1[i] = r.read_bits(num_bits)?;
-				}
+				// One per CTB row or tile, so a 4K picture with wavefronts has
+				// more than a fixed array would hold.
+				let num_bits = usize::from(hdr.offset_len_minus1 + 1);
+				hdr.entry_point_offset_minus1 = (0..hdr.num_entry_point_offsets)
+					.map(|_| r.read_bits(num_bits))
+					.collect::<Result<_, _>>()?;
 			}
 		}
 

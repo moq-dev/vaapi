@@ -2253,6 +2253,35 @@ mod tests {
 		assert!(decoder.flush().expect("flush the decoder").is_empty());
 	}
 
+	/// A 4K H.265 stream coded with wavefronts, as x265 codes by default, signals
+	/// an entry point per CTB row: 33 at 64-pixel CTBs, past what a fixed array
+	/// of 32 held.
+	#[test]
+	fn a_4k_h265_wavefront_stream_decodes() {
+		const PICTURES: usize = 2;
+		let size = (3840, 2160);
+
+		let Some(stream) = software_encode(Codec::H265, size, PICTURES, false) else {
+			eprintln!("skipping: no ffmpeg that encodes H.265");
+			return;
+		};
+		let Ok(mut decoder) = Decoder::new(Config {
+			codec: Codec::H265,
+			..Config::new()
+		}) else {
+			eprintln!("skipping: no VA-API H.265 decoder");
+			return;
+		};
+
+		let mut decoded = Vec::new();
+		for (index, unit) in split_access_units(Codec::H265, &stream).iter().enumerate() {
+			decoded.extend(decoder.decode(unit, index as u64).expect("decode an access unit"));
+		}
+		decoded.extend(decoder.flush().expect("flush the decoder"));
+		assert_eq!(decoded.len(), PICTURES);
+		assert!(decoded.iter().all(|picture| (picture.width, picture.height) == size));
+	}
+
 	/// A second H.265 sequence at another size decodes at that size, and the
 	/// first sequence's tail comes out ahead of it.
 	#[test]

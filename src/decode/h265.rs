@@ -580,6 +580,11 @@ fn format(sps: &Sps) -> anyhow::Result<Format> {
 			sps.bit_depth_chroma_minus8 + 8
 		);
 	}
+	// H.265 codes interlaced video as a sequence of field pictures, each of
+	// which would otherwise come out as a frame of half the height.
+	if sps.vui_parameters_present_flag && sps.vui_parameters.field_seq_flag {
+		bail!("interlaced H.265 is not supported");
+	}
 
 	// The conformance window is in chroma samples, two luma samples each way
 	// for 4:2:0.
@@ -740,8 +745,9 @@ fn build_pic_param(
 		pps.log2_parallel_merge_level_minus2,
 		pps.num_tile_columns_minus1,
 		pps.num_tile_rows_minus1,
-		pps.column_width_minus1.map(|width| width as u16),
-		pps.row_height_minus1.map(|height| height as u16),
+		// VA takes the signalled sizes only; the last of each is inferred.
+		std::array::from_fn(|i| pps.column_width_minus1[i] as u16),
+		std::array::from_fn(|i| pps.row_height_minus1[i] as u16),
 		&slice_parsing_fields,
 		sps.log2_max_pic_order_cnt_lsb_minus4,
 		sps.num_short_term_ref_pic_sets,
@@ -938,6 +944,62 @@ fn build_slice_param(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// An SPS this decoder takes: Main, 8-bit 4:2:0, 64x64.
+	fn main_sps() -> Sps {
+		let mut sps = Sps {
+			chroma_format_idc: 1,
+			pic_width_in_luma_samples: 64,
+			pic_height_in_luma_samples: 64,
+			..Default::default()
+		};
+		sps.profile_tier_level.general_profile_idc = 1;
+		sps
+	}
+
+	#[test]
+	fn a_field_coded_sequence_is_rejected() {
+		assert!(format(&main_sps()).is_ok());
+
+		let mut sps = main_sps();
+		sps.vui_parameters_present_flag = true;
+		sps.vui_parameters.field_seq_flag = true;
+		let err = format(&sps).expect_err("a field-coded sequence decoded as frames");
+		assert!(err.to_string().contains("interlaced"), "{err}");
+	}
+
+	/// C.5.2.2: a picture is overdue once it has waited SpsMaxLatencyPictures,
+	/// the reorder limit plus sps_max_latency_increase_plus1 minus one, not
+	/// sps_max_latency_increase_plus1 alone.
+	#[test]
+	fn the_latency_limit_counts_from_the_reorder_limit() {
+		let mut sps = main_sps();
+		sps.max_num_reorder_pics[0] = 2;
+		sps.max_latency_increase_plus1[0] = 1;
+
+		let mut dpb = Dpb::<()>::default();
+		dpb.set_max_num_pics(MAX_DPB_SIZE);
+		let store = |dpb: &mut Dpb<()>, poc| {
+			let mut pic = PictureData::default();
+			pic.pic_output_flag = true;
+			pic.pic_order_cnt_val = poc;
+			dpb.store_picture(Rc::new(RefCell::new(pic)), ()).unwrap();
+		};
+
+		// Two waiting, the oldest for one picture: within both limits.
+		store(&mut dpb, 0);
+		store(&mut dpb, 4);
+		assert!(!dpb.needs_additional_bumping(&sps));
+
+		// Output the others around POC 4 until it has waited two pictures, which
+		// is SpsMaxLatencyPictures, with still only two waiting.
+		dpb.bump(false);
+		store(&mut dpb, 2);
+		assert!(!dpb.needs_additional_bumping(&sps));
+		dpb.bump(false);
+		store(&mut dpb, 6);
+		assert!(dpb.needs_additional_bumping(&sps));
+	}
 
 	#[test]
 	fn the_diagonal_scan_matches_the_specification() {

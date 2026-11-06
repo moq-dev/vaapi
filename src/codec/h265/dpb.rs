@@ -117,19 +117,26 @@ impl<T: Clone> Dpb<T> {
 
 	/// Whether the DPB needs bumping. See C.5.2.2.
 	pub fn needs_bumping(&mut self, sps: &Sps) -> bool {
-		let num_needed_for_output = self.pictures().filter(|pic| pic.needed_for_output).count();
-
 		let highest_tid = sps.max_sub_layers_minus1;
-		let max_num_reorder_pics = sps.max_num_reorder_pics[usize::from(highest_tid)];
-		let max_latency_increase_plus1 = sps.max_latency_increase_plus1[usize::from(highest_tid)];
-		let pic_over_max_latency = self
-			.pictures()
-			.find(|pic| pic.needed_for_output && pic.pic_latency_cnt >= i32::from(max_latency_increase_plus1));
 		let max_dec_pic_buffering = usize::from(sps.max_dec_pic_buffering_minus1[usize::from(highest_tid)]) + 1;
 
-		num_needed_for_output > max_num_reorder_pics.into()
-			|| (max_latency_increase_plus1 != 0 && pic_over_max_latency.is_some())
-			|| self.entries().len() >= max_dec_pic_buffering
+		self.output_overdue(sps) || self.entries().len() >= max_dec_pic_buffering
+	}
+
+	/// Whether more pictures wait for output than the reorder limit allows, or
+	/// one has waited past the latency limit, SpsMaxLatencyPictures (7-9).
+	fn output_overdue(&self, sps: &Sps) -> bool {
+		let highest_tid = usize::from(sps.max_sub_layers_minus1);
+		let max_num_reorder_pics = sps.max_num_reorder_pics[highest_tid];
+		let max_latency_increase_plus1 = sps.max_latency_increase_plus1[highest_tid];
+		let max_latency_pictures = i32::from(max_num_reorder_pics) + i32::from(max_latency_increase_plus1) - 1;
+
+		let num_needed_for_output = self.pictures().filter(|pic| pic.needed_for_output).count();
+		let pic_over_max_latency = self
+			.pictures()
+			.any(|pic| pic.needed_for_output && pic.pic_latency_cnt >= max_latency_pictures);
+
+		num_needed_for_output > max_num_reorder_pics.into() || (max_latency_increase_plus1 != 0 && pic_over_max_latency)
 	}
 
 	/// Find the lowest POC in the DPB that can be bumped.
@@ -176,18 +183,7 @@ impl<T: Clone> Dpb<T> {
 
 	/// See C.5.2.3. Happens when we are done decoding the picture.
 	pub fn needs_additional_bumping(&mut self, sps: &Sps) -> bool {
-		let num_needed_for_output = self.pictures().filter(|pic| pic.needed_for_output).count();
-		let highest_tid = sps.max_sub_layers_minus1;
-
-		let max_num_reorder_pics = sps.max_num_reorder_pics[usize::from(highest_tid)];
-		let max_latency_increase_plus1 = sps.max_latency_increase_plus1[usize::from(highest_tid)];
-
-		let pic_over_max_latency = self
-			.pictures()
-			.find(|pic| pic.needed_for_output && pic.pic_latency_cnt >= i32::from(max_latency_increase_plus1));
-
-		num_needed_for_output > max_num_reorder_pics.into()
-			|| (max_latency_increase_plus1 != 0 && pic_over_max_latency.is_some())
+		self.output_overdue(sps)
 	}
 
 	/// Clears the DPB, dropping all the pictures.
