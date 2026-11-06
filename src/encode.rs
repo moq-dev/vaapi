@@ -5,13 +5,15 @@
 // Adapted from discord/cros-codecs (encoder/stateless/h264/vaapi.rs), itself
 // BSD-3-Clause / Copyright The ChromiumOS Authors. See LICENSE.cros-codecs.
 
-//! Thin VA-API H.264 encoder built on the vendored libva binding.
+//! Thin VA-API H.264 and H.265 encoder built on the vendored libva binding.
 //!
-//! Reuses the backend-agnostic bitstream layer ([`crate::codec::h264`]) from
-//! discord/cros-codecs (BSD-3-Clause) for SPS/PPS/slice synthesis, and drives
-//! libva directly for surface upload + slice submission, rather than vendoring
-//! cros-codecs's generic multi-backend encoder framework. The per-frame VA
-//! buffer population is ported from cros-codecs's `encoder/stateless/h264/vaapi.rs`.
+//! For H.264 it reuses the backend-agnostic bitstream layer
+//! ([`crate::codec::h264`]) from discord/cros-codecs (BSD-3-Clause) for
+//! SPS/PPS/slice synthesis, and drives libva directly for surface upload +
+//! slice submission, rather than vendoring cros-codecs's generic multi-backend
+//! encoder framework. The per-frame VA buffer population is ported from
+//! cros-codecs's `encoder/stateless/h264/vaapi.rs`. H.265 writes its own
+//! parameter sets and slice headers (see `h265.rs`).
 //!
 //! Low-latency only: IPPP (no B-frames), one reference frame, matching the
 //! VideoToolbox / Media Foundation / NVENC backends in moq-video.
@@ -38,6 +40,7 @@ use std::sync::Arc;
 use crate::codec::h264::parser::SpsBuilder;
 use crate::codec::h264::parser::{Level, Pps, PpsBuilder, Profile, SliceHeader, SliceHeaderBuilder, SliceType, Sps};
 use crate::codec::h264::synthesizer::Synthesizer;
+use crate::codec::Codec;
 use crate::dmabuf::DmaBuf;
 use crate::vpp::Processor;
 use crate::{
@@ -47,10 +50,12 @@ use crate::{
 	EncSliceParameter, EncSliceParameterBufferH264, H264EncFrameCropOffsets, H264EncPicFields, H264EncSeqFields,
 	H264VuiFields, Image, MappedCodedBuffer, Picture, PictureH264, RcFlags, Surface, SurfaceMemoryDescriptor,
 	UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile, VA_ATTRIB_NOT_SUPPORTED,
-	VA_ENC_PACKED_HEADER_PICTURE, VA_ENC_PACKED_HEADER_SEQUENCE, VA_FOURCC_ARGB, VA_FOURCC_BGRA, VA_FOURCC_BGRX,
-	VA_FOURCC_NV12, VA_FOURCC_RGBA, VA_FOURCC_RGBX, VA_FOURCC_XRGB, VA_INVALID_ID, VA_PICTURE_H264_INVALID,
-	VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RC_CBR, VA_RT_FORMAT_YUV420,
+	VA_ENC_PACKED_HEADER_PICTURE, VA_ENC_PACKED_HEADER_SEQUENCE, VA_ENC_PACKED_HEADER_SLICE, VA_FOURCC_ARGB,
+	VA_FOURCC_BGRA, VA_FOURCC_BGRX, VA_FOURCC_NV12, VA_FOURCC_RGBA, VA_FOURCC_RGBX, VA_FOURCC_XRGB, VA_INVALID_ID,
+	VA_PICTURE_H264_INVALID, VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RC_CBR, VA_RT_FORMAT_YUV420,
 };
+
+mod h265;
 
 /// Whether a frame is used as a reference, and for how long.
 /// (Vendored from discord/cros-codecs, BSD-3-Clause; used by the slice synthesizer.)
@@ -77,9 +82,11 @@ pub const RATE_CONTROL_WINDOW_MS: u32 = 1_500;
 /// `max_frame_num` upper bound for the low-delay GOP; matches cros-codecs.
 const LIMIT: u32 = 2048;
 
-/// H.264 encoder configuration. Dimensions must be even (4:2:0 chroma).
+/// Encoder configuration. Dimensions must be even (4:2:0 chroma).
 #[derive(Clone, Debug)]
 pub struct Config {
+	/// The format to encode, H.264 unless set.
+	pub codec: Codec,
 	pub width: u32,
 	pub height: u32,
 	pub framerate: u32,
@@ -89,8 +96,9 @@ pub struct Config {
 	pub gop: u32,
 	/// DRM render node to open (e.g. `/dev/dri/renderD128`).
 	///
-	/// `None`, the default, opens the first node whose driver can encode H.264,
-	/// and [`Encoder::config`] then names the node it picked.
+	/// `None`, the default, opens the first node whose driver can encode
+	/// [`codec`](Self::codec), and [`Encoder::config`] then names the node it
+	/// picked.
 	pub device: Option<PathBuf>,
 	/// Color space written into the SPS, and the target of a conversion from RGB.
 	///
@@ -100,8 +108,10 @@ pub struct Config {
 }
 
 impl Config {
+	/// Returns an H.264 configuration; set [`codec`](Self::codec) for another format.
 	pub fn new(width: u32, height: u32, framerate: u32, bitrate: u32, gop: u32) -> Self {
 		Self {
+			codec: Codec::H264,
 			width,
 			height,
 			framerate,
@@ -120,20 +130,65 @@ struct FrameMeta {
 	frame_num: u32,
 }
 
-/// A VA-API H.264 encoder. Built once, fed NV12 frames, emits Annex-B H.264.
+impl FrameMeta {
+	/// Returns the H.264 order count and frame number of the picture `count` pictures after an IDR.
+	///
+	/// frame_num counts modulo MaxFrameNum, and the slice header carries only
+	/// the low bits of the picture order count; the full count goes to the
+	/// driver in the picture parameters.
+	fn new(count: u32) -> Self {
+		Self {
+			poc: count.wrapping_mul(2),
+			frame_num: count % LIMIT,
+		}
+	}
+}
+
+/// The picture a P picture predicts from: the previous one.
+#[derive(Copy, Clone)]
+struct Reference {
+	/// Its reconstructed surface.
+	surface: crate::bindings::VASurfaceID,
+	/// How many pictures after the IDR it came.
+	count: u32,
+}
+
+/// What one picture's parameter buffers are built from.
+struct PictureInfo<'a> {
+	idr: bool,
+	/// How many pictures after the IDR this one comes.
+	count: u32,
+	/// The surface its reconstruction is written to.
+	recon: crate::bindings::VASurfaceID,
+	reference: Option<Reference>,
+	coded: &'a EncCodedBuffer,
+	bitrate: u32,
+}
+
+/// The bitstream syntax of the stream being encoded.
+enum Syntax {
+	H264 {
+		sps: Rc<Sps>,
+		pps: Rc<Pps>,
+	},
+	H265 {
+		stream: h265::Stream,
+		/// The packed header kinds the driver takes from us; it writes the rest.
+		packed: u32,
+	},
+}
+
+/// A VA-API H.264 or H.265 encoder. Built once, fed NV12 frames, emits an Annex-B stream.
 pub struct Encoder {
 	config: Config,
-	sps: Rc<Sps>,
-	pps: Rc<Pps>,
-	width_mbs: u16,
-	height_mbs: u16,
+	syntax: Syntax,
 
 	// Source surface (reused; NV12 re-uploaded per frame) and a 2-deep
 	// reconstructed surface ring (current + previous reference for IPPP).
 	input: Option<Surface<()>>,
 	recon: Vec<Surface<()>>,
-	/// Reference from the previous encoded frame: (recon index, metadata).
-	reference: Option<(usize, FrameMeta)>,
+	/// Reference from the previous encoded frame: (recon index, pictures after the IDR).
+	reference: Option<(usize, u32)>,
 
 	counter: u32,
 
@@ -153,26 +208,27 @@ pub struct Encoder {
 }
 
 impl Encoder {
-	/// Opens [`Config::device`], or the first render node that encodes H.264, and sets up an encode session for `config`.
+	/// Opens [`Config::device`], or the first render node that encodes [`Config::codec`], and sets up an encode session for `config`.
 	///
 	/// # Errors
 	///
 	/// Fails when libva cannot be loaded, when the named node cannot be opened
-	/// or does not encode H.264 (a named node is never swapped for another), when
-	/// no node encodes H.264, and when the driver refuses the session.
+	/// or does not encode the codec (a named node is never swapped for
+	/// another), when no node encodes it, and when the driver refuses the
+	/// session or, for H.265, requires a coding tool this encoder does not write.
 	pub fn new(mut config: Config) -> anyhow::Result<Self> {
+		let codec = config.codec;
 		let (device, display) = match config.device.take() {
 			Some(device) => {
 				let display = Display::open_drm_display(&device)
 					.map_err(|e| anyhow::anyhow!("open DRM display {device:?}: {e:?}"))?;
 				(device, display)
 			}
-			None => {
-				crate::display::open_first(probe).map_err(|e| e.context("find a render node that encodes H.264"))?
-			}
+			None => crate::display::open_first(|display| probe(display, codec))
+				.map_err(|e| e.context(format!("find a render node that encodes {codec:?}")))?,
 		};
 
-		let entrypoint = encode_entrypoint(&display)?;
+		let entrypoint = encode_entrypoint(&display, codec)?;
 		let mut attrs = vec![
 			VAConfigAttrib {
 				type_: VAConfigAttribType::VAConfigAttribRTFormat,
@@ -183,24 +239,49 @@ impl Encoder {
 				value: VA_RC_CBR,
 			},
 		];
-		// The SPS and PPS go out as packed headers, so the VUI (color, frame
-		// buffering) and the level are ours. iHD takes them without being told;
-		// a driver that follows the spec writes its own unless the config asks.
-		let packed = packed_headers(&display, entrypoint);
+		// The parameter sets go out as packed headers, so the VUI (color, frame
+		// buffering) and the level are ours. For H.264 that is the SPS and PPS;
+		// iHD takes them without being told, and a driver that follows the spec
+		// writes its own unless the config asks. For H.265 it is the VPS, SPS and
+		// PPS as one sequence header, plus each slice header, as ffmpeg packs
+		// them; the driver writes whichever kind it does not take.
+		let wanted = match codec {
+			Codec::H264 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE,
+			Codec::H265 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_SLICE,
+		};
+		let packed = packed_headers(&display, codec, entrypoint) & wanted;
 		if packed != 0 {
 			attrs.push(VAConfigAttrib {
 				type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
 				value: packed,
 			});
 		} else {
-			log::warn!("the driver takes no packed SPS/PPS; the stream carries the driver's own headers");
+			log::warn!("the driver takes no packed {codec:?} headers; the stream carries the driver's own");
 		}
-		let va_config = display
-			.create_config(attrs, VAProfile::VAProfileH264Main, entrypoint)
+		let mut va_config = display
+			.create_config(attrs, profile(codec), entrypoint)
 			.map_err(|e| anyhow::anyhow!("create VA config: {e:?}"))?;
 
+		let syntax = match codec {
+			Codec::H264 => {
+				let (sps, pps) = build_sps_pps(&config);
+				Syntax::H264 { sps, pps }
+			}
+			Codec::H265 => Syntax::H265 {
+				stream: h265::Stream::new(&display, entrypoint, &mut va_config, &config)?,
+				packed,
+			},
+		};
+		// H.264 sizes the context and its references to the frame, which has
+		// always worked; H.265 to whole minimum coding blocks, as ffmpeg does,
+		// and to the driver's surface alignment.
+		let size = match &syntax {
+			Syntax::H264 { .. } => (config.width, config.height),
+			Syntax::H265 { stream, .. } => stream.coded(),
+		};
+
 		let context = display
-			.create_context::<()>(&va_config, config.width, config.height, None, true)
+			.create_context::<()>(&va_config, size.0, size.1, None, true)
 			.map_err(|e| anyhow::anyhow!("create VA context: {e:?}"))?;
 
 		let coded_size = coded_size(config.bitrate);
@@ -208,15 +289,11 @@ impl Encoder {
 			.create_enc_coded(coded_size)
 			.map_err(|e| anyhow::anyhow!("create coded buffer: {e:?}"))?;
 
-		let input = make_surface(&display, &config)?;
-		let recon = vec![make_surface(&display, &config)?, make_surface(&display, &config)?];
-
-		let (sps, pps) = build_sps_pps(&config);
-		let width_mbs = sps.pic_width_in_mbs_minus1 + 1;
-		let height_mbs = sps.pic_height_in_map_units_minus1 + 1;
+		let input = make_surface(&display, (config.width, config.height))?;
+		let recon = vec![make_surface(&display, size)?, make_surface(&display, size)?];
 
 		log::info!(
-			"opened VA-API H.264 encoder on {:?}: {}x{} @ {}fps, {} bps, low power: {}",
+			"opened VA-API {codec:?} encoder on {:?}: {}x{} @ {}fps, {} bps, low power: {}",
 			device,
 			config.width,
 			config.height,
@@ -227,10 +304,7 @@ impl Encoder {
 		config.device = Some(device);
 		Ok(Self {
 			config,
-			sps,
-			pps,
-			width_mbs,
-			height_mbs,
+			syntax,
 			input: Some(input),
 			recon,
 			reference: None,
@@ -245,8 +319,8 @@ impl Encoder {
 		})
 	}
 
-	/// Encodes one tightly-packed NV12 frame, returning Annex-B H.264 (with inline
-	/// SPS/PPS on each IDR). `keyframe` forces an IDR.
+	/// Encodes one tightly-packed NV12 frame, returning Annex-B (with the
+	/// parameter sets inline on each IDR). `keyframe` forces an IDR.
 	///
 	/// # Errors
 	///
@@ -265,13 +339,14 @@ impl Encoder {
 		result
 	}
 
-	/// Encodes one frame held in a DMA-BUF, returning Annex-B H.264 like
+	/// Encodes one frame held in a DMA-BUF, returning Annex-B like
 	/// [`encode_nv12`](Self::encode_nv12).
 	///
-	/// An NV12 buffer at the encoder's size, whose size is a whole number of
-	/// macroblocks and whose [`color`](DmaBuf::color) is the stream's or
-	/// unknown, is imported and encoded in place. Any other mapped format or
-	/// size goes through the video processor into the encoder's own surface
+	/// An NV12 buffer at the encoder's size, which the encoder reads without
+	/// padding (whole macroblocks for H.264; for H.265, whole minimum coding
+	/// blocks at the driver's surface alignment), and whose
+	/// [`color`](DmaBuf::color) is the stream's or unknown, is imported and
+	/// encoded in place. Any other mapped format or size goes through the video processor into the encoder's own surface
 	/// first: scaled to the encoder's size and converted to [`Config::color`].
 	/// A YUV buffer with no color of its own is taken to be in that space
 	/// already. Nothing reaches the CPU on either path.
@@ -296,10 +371,14 @@ impl Encoder {
 			.fourcc()
 			.ok_or_else(|| anyhow::anyhow!("no VA-API format for DRM format {:#010x}", buffer.drm_format))?;
 		let color = self.config.color;
+		let size = (self.config.width, self.config.height);
+		let unpadded = match &self.syntax {
+			Syntax::H264 { .. } => size.0 % 16 == 0 && size.1 % 16 == 0,
+			Syntax::H265 { stream, .. } => stream.coded() == size,
+		};
 		let in_place = fourcc == VA_FOURCC_NV12
-			&& (buffer.width, buffer.height) == (self.config.width, self.config.height)
-			&& buffer.width % 16 == 0
-			&& buffer.height % 16 == 0
+			&& (buffer.width, buffer.height) == size
+			&& unpadded
 			&& buffer.color.is_none_or(|own| own == color);
 		if in_place {
 			let source = buffer.import(&self.display, Some(UsageHint::USAGE_HINT_ENCODER))?;
@@ -376,65 +455,48 @@ impl Encoder {
 	) -> anyhow::Result<Vec<u8>> {
 		let is_idr = keyframe || self.counter % self.config.gop == 0;
 		if is_idr {
-			// IDR resets the H.264 frame numbering and the reference list.
+			// An IDR restarts the picture count and drops the reference.
 			self.counter = 0;
 			self.reference = None;
 		}
 
-		// frame_num counts modulo MaxFrameNum, and the slice header carries only
-		// the low bits of the picture order count; the full count goes to the
-		// driver in the picture parameters.
-		let meta = FrameMeta {
-			poc: self.counter.wrapping_mul(2),
-			frame_num: self.counter % LIMIT,
-		};
 		let recon_idx = (self.counter as usize) % self.recon.len();
-
-		let slice_type = if is_idr { SliceType::I } else { SliceType::P };
-		let header = SliceHeaderBuilder::new(&self.pps)
-			.slice_type(slice_type)
-			.first_mb_in_slice(0)
-			.frame_num(meta.frame_num as u16)
-			.pic_order_cnt_lsb((meta.poc % (LIMIT * 2)) as u16)
-			.build();
-
-		let num_macroblocks = self.width_mbs as u32 * self.height_mbs as u32;
-		let bits_per_second = self.config.bitrate;
-
-		// Reference (previous reconstructed frame) for P slices: surface id + meta.
+		// The reference is the previous picture's reconstruction, for a P picture.
 		let reference = match (is_idr, self.reference) {
-			(false, Some((ref_idx, ref_meta))) => Some((self.recon[ref_idx].id(), ref_meta)),
+			(false, Some((index, count))) => Some(Reference {
+				surface: self.recon[index].id(),
+				count,
+			}),
 			_ => None,
 		};
-
-		let seq_param = build_enc_seq_param(&self.sps, bits_per_second, LIMIT, 0);
-		let pic_param = build_enc_pic_param(
-			&self.pps,
-			&self.coded,
-			self.recon[recon_idx].id(),
-			meta,
-			is_idr,
+		let info = PictureInfo {
+			idr: is_idr,
+			count: self.counter,
+			recon: self.recon[recon_idx].id(),
 			reference,
-		);
-		let slice_param = build_enc_slice_param(&self.pps, &header, reference, num_macroblocks);
+			coded: &self.coded,
+			bitrate: self.config.bitrate,
+		};
+		let buffers = match &self.syntax {
+			Syntax::H264 { sps, pps } => {
+				let mut buffers = h264_buffers(sps, pps, &info);
+				if is_idr {
+					buffers.extend(packed_parameter_sets(sps, pps)?);
+				}
+				buffers
+			}
+			Syntax::H265 { stream, packed } => stream.buffers(&self.config, &info, *packed),
+		};
 
-		let mut picture = Picture::new(meta.frame_num as u64, Rc::clone(&self.context), source);
+		let mut picture = Picture::new(self.counter as u64, Rc::clone(&self.context), source);
 
 		// VA-API spec buffer order: sequence, picture, slice, then packed headers,
 		// then rate-control misc params.
-		picture.add_buffer(self.create(seq_param)?);
-		picture.add_buffer(self.create(pic_param)?);
-		picture.add_buffer(self.create(slice_param)?);
-
-		if is_idr {
-			let (sps_param, sps_data) = packed_header(EncPackedHeaderType::Sequence, &self.packed_sps()?);
-			let (pps_param, pps_data) = packed_header(EncPackedHeaderType::Picture, &self.packed_pps()?);
-			picture.add_buffer(self.create(sps_param)?);
-			picture.add_buffer(self.create(sps_data)?);
-			picture.add_buffer(self.create(pps_param)?);
-			picture.add_buffer(self.create(pps_data)?);
+		for buffer in buffers {
+			picture.add_buffer(self.create(buffer)?);
 		}
 
+		let bits_per_second = self.config.bitrate;
 		let rc = EncMiscParameterRateControl::new(
 			bits_per_second,
 			100,                    // target_percentage (CBR)
@@ -467,7 +529,7 @@ impl Encoder {
 		// The reconstructed surface syncs implicitly; read the coded bitstream.
 		let bitstream = self.read_coded()?;
 
-		self.reference = Some((recon_idx, meta));
+		self.reference = Some((recon_idx, self.counter));
 		self.counter += 1;
 		self.reset_rate_control = false;
 		Ok(bitstream)
@@ -477,20 +539,6 @@ impl Encoder {
 		self.context
 			.create_buffer(buffer)
 			.map_err(|e| anyhow::anyhow!("create VA buffer: {e:?}"))
-	}
-
-	fn packed_sps(&self) -> anyhow::Result<Vec<u8>> {
-		let mut buf = Vec::new();
-		Synthesizer::<'_, Sps, _>::synthesize(3, &self.sps, &mut buf, true)
-			.map_err(|e| anyhow::anyhow!("synthesize SPS: {e:?}"))?;
-		Ok(buf)
-	}
-
-	fn packed_pps(&self) -> anyhow::Result<Vec<u8>> {
-		let mut buf = Vec::new();
-		Synthesizer::<'_, Pps, _>::synthesize(3, &self.pps, &mut buf, true)
-			.map_err(|e| anyhow::anyhow!("synthesize PPS: {e:?}"))?;
-		Ok(buf)
 	}
 
 	fn read_coded(&self) -> anyhow::Result<Vec<u8>> {
@@ -503,24 +551,32 @@ impl Encoder {
 	}
 }
 
-/// Checks that `display`'s driver can encode H.264, which is what [`Encoder::new`] needs of a render node.
+/// Checks that `display`'s driver can encode `codec`, which is what [`Encoder::new`] needs of a render node.
 ///
 /// # Errors
 ///
-/// Fails when the driver offers neither the full nor the low-power H.264 Main
-/// encode entrypoint, or cannot be asked.
-pub fn probe(display: &Display) -> anyhow::Result<()> {
-	encode_entrypoint(display).map(drop)
+/// Fails when the driver offers neither the full nor the low-power Main
+/// profile encode entrypoint for `codec`, or cannot be asked.
+pub fn probe(display: &Display, codec: Codec) -> anyhow::Result<()> {
+	encode_entrypoint(display, codec).map(drop)
 }
 
-/// Returns the entrypoint to encode H.264 Main with: the full one, or the low-power one where it is all there is.
+/// Returns the VA profile `codec` is encoded in.
+fn profile(codec: Codec) -> VAProfile::Type {
+	match codec {
+		Codec::H264 => VAProfile::VAProfileH264Main,
+		Codec::H265 => h265::PROFILE,
+	}
+}
+
+/// Returns the entrypoint to encode `codec` with: the full one, or the low-power one where it is all there is.
 ///
-/// Some Intel parts expose H.264 encode only through `VAEntrypointEncSliceLP`.
-fn encode_entrypoint(display: &Display) -> anyhow::Result<VAEntrypoint::Type> {
+/// Some Intel parts expose encode only through `VAEntrypointEncSliceLP`.
+fn encode_entrypoint(display: &Display, codec: Codec) -> anyhow::Result<VAEntrypoint::Type> {
 	let entrypoints = display
-		.query_config_entrypoints(VAProfile::VAProfileH264Main)
-		.map_err(|e| anyhow::anyhow!("query H.264 Main entrypoints: {e:?}"))?;
-	pick_entrypoint(&entrypoints).ok_or_else(|| anyhow::anyhow!("the device has no H.264 Main encode entrypoint"))
+		.query_config_entrypoints(profile(codec))
+		.map_err(|e| anyhow::anyhow!("query {codec:?} Main entrypoints: {e:?}"))?;
+	pick_entrypoint(&entrypoints).ok_or_else(|| anyhow::anyhow!("the device has no {codec:?} Main encode entrypoint"))
 }
 
 /// Returns the encode entrypoint to use out of those a device offers: the full one when present.
@@ -530,22 +586,22 @@ fn pick_entrypoint(offered: &[VAEntrypoint::Type]) -> Option<VAEntrypoint::Type>
 		.find(|entrypoint| offered.contains(entrypoint))
 }
 
-/// Returns the packed header kinds to ask for: sequence and picture, where the driver takes them.
+/// Returns the packed header kinds the driver takes for `codec` at `entrypoint`.
 ///
-/// Zero when the driver takes neither, or when asking fails.
-fn packed_headers(display: &Display, entrypoint: VAEntrypoint::Type) -> u32 {
+/// Zero when it takes none, or when asking fails.
+fn packed_headers(display: &Display, codec: Codec, entrypoint: VAEntrypoint::Type) -> u32 {
 	let mut attrs = [VAConfigAttrib {
 		type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
 		value: 0,
 	}];
 	if display
-		.get_config_attributes(VAProfile::VAProfileH264Main, entrypoint, &mut attrs)
+		.get_config_attributes(profile(codec), entrypoint, &mut attrs)
 		.is_err()
 		|| attrs[0].value & VA_ATTRIB_NOT_SUPPORTED != 0
 	{
 		return 0;
 	}
-	attrs[0].value & (VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE)
+	attrs[0].value
 }
 
 /// Returns the lowest H.264 level, from 4 up, whose frame size and macroblock rate cover the stream.
@@ -591,13 +647,13 @@ fn is_rgb(fourcc: u32) -> bool {
 }
 
 /// Allocate one NV12 encode surface.
-fn make_surface(display: &Arc<Display>, config: &Config) -> anyhow::Result<Surface<()>> {
+fn make_surface(display: &Arc<Display>, (width, height): (u32, u32)) -> anyhow::Result<Surface<()>> {
 	let mut surfaces = display
 		.create_surfaces::<()>(
 			VA_RT_FORMAT_YUV420,
 			Some(VA_FOURCC_NV12),
-			config.width,
-			config.height,
+			width,
+			height,
 			Some(UsageHint::USAGE_HINT_ENCODER),
 			vec![()],
 		)
@@ -687,6 +743,42 @@ fn build_sps_pps(config: &Config) -> (Rc<Sps>, Rc<Pps>) {
 		.build();
 
 	(sps, pps)
+}
+
+/// Returns the sequence, picture and slice parameters of one H.264 picture.
+fn h264_buffers(sps: &Sps, pps: &Rc<Pps>, picture: &PictureInfo<'_>) -> Vec<BufferType> {
+	let meta = FrameMeta::new(picture.count);
+	let slice_type = if picture.idr { SliceType::I } else { SliceType::P };
+	let header = SliceHeaderBuilder::new(pps)
+		.slice_type(slice_type)
+		.first_mb_in_slice(0)
+		.frame_num(meta.frame_num as u16)
+		.pic_order_cnt_lsb((meta.poc % (LIMIT * 2)) as u16)
+		.build();
+	let macroblocks = (sps.pic_width_in_mbs_minus1 as u32 + 1) * (sps.pic_height_in_map_units_minus1 as u32 + 1);
+	let reference = picture
+		.reference
+		.map(|reference| (reference.surface, FrameMeta::new(reference.count)));
+
+	vec![
+		build_enc_seq_param(sps, picture.bitrate, LIMIT, 0),
+		build_enc_pic_param(pps, picture.coded, picture.recon, meta, picture.idr, reference),
+		build_enc_slice_param(pps, &header, reference, macroblocks),
+	]
+}
+
+/// Returns the SPS and PPS as packed headers, which go out with every IDR.
+fn packed_parameter_sets(sps: &Sps, pps: &Pps) -> anyhow::Result<[BufferType; 4]> {
+	let mut sps_nal = Vec::new();
+	Synthesizer::<'_, Sps, _>::synthesize(3, sps, &mut sps_nal, true)
+		.map_err(|e| anyhow::anyhow!("synthesize SPS: {e:?}"))?;
+	let mut pps_nal = Vec::new();
+	Synthesizer::<'_, Pps, _>::synthesize(3, pps, &mut pps_nal, true)
+		.map_err(|e| anyhow::anyhow!("synthesize PPS: {e:?}"))?;
+
+	let (sps_param, sps_data) = packed_header(EncPackedHeaderType::Sequence, &sps_nal);
+	let (pps_param, pps_data) = packed_header(EncPackedHeaderType::Picture, &pps_nal);
+	Ok([sps_param, sps_data, pps_param, pps_data])
 }
 
 fn build_invalid_pic() -> PictureH264 {
@@ -898,21 +990,35 @@ mod tests {
 	use crate::dmabuf::DmaBuf;
 	use crate::{VA_RT_FORMAT_RGB32, VA_RT_FORMAT_YUV420};
 
-	const WIDTH: u32 = 320;
-	const HEIGHT: u32 = 240;
+	// A size every driver encodes: radeonsi's H.265 minimum on VCN 5 is 384 wide.
+	const WIDTH: u32 = 640;
+	const HEIGHT: u32 = 480;
+	const CODECS: [Codec; 2] = [Codec::H264, Codec::H265];
 
-	fn config() -> Config {
-		Config::new(WIDTH, HEIGHT, 30, 2_000_000, 30)
+	fn config(codec: Codec) -> Config {
+		Config {
+			codec,
+			..Config::new(WIDTH, HEIGHT, 30, 2_000_000, 30)
+		}
 	}
 
-	/// Opens an encoder, or `None` to skip on a machine without VA-API H.264 encode.
+	/// Opens an encoder, or `None` to skip on a machine without VA-API encode of its codec.
 	fn encoder(config: Config) -> Option<Encoder> {
+		let codec = config.codec;
 		match Encoder::new(config) {
 			Ok(encoder) => Some(encoder),
 			Err(err) => {
-				eprintln!("skipping: no VA-API H.264 encoder: {err:#}");
+				eprintln!("skipping: no VA-API {codec:?} encoder: {err:#}");
 				None
 			}
+		}
+	}
+
+	/// The NAL unit types that open an IDR access unit: the IDR slice, then the parameter sets it carries.
+	fn idr_types(codec: Codec) -> (u8, &'static [u8]) {
+		match codec {
+			Codec::H264 => (5, &[7, 8]),
+			Codec::H265 => (19, &[32, 33, 34]),
 		}
 	}
 
@@ -939,18 +1045,24 @@ mod tests {
 	///
 	/// The tests run as threads of one process, so the process id alone would
 	/// let two of them share a file.
-	fn temp_path(label: &str) -> PathBuf {
+	///
+	/// Its extension names `codec`, for ffmpeg to pick the demuxer by.
+	fn temp_path(codec: Codec, label: &str) -> PathBuf {
 		static NEXT: AtomicU32 = AtomicU32::new(0);
 		let index = NEXT.fetch_add(1, Ordering::Relaxed);
-		std::env::temp_dir().join(format!("moq-vaapi-{label}-{}-{index}.264", std::process::id()))
+		let extension = match codec {
+			Codec::H264 => "264",
+			Codec::H265 => "265",
+		};
+		std::env::temp_dir().join(format!("moq-vaapi-{label}-{}-{index}.{extension}", std::process::id()))
 	}
 
 	/// Decodes an Annex-B stream with ffmpeg's software decoder into NV12
 	/// pictures, or `None` to skip without ffmpeg.
-	fn ffmpeg_decode(stream: &[u8], name: &str) -> Option<Vec<u8>> {
+	fn ffmpeg_decode(codec: Codec, stream: &[u8], name: &str) -> Option<Vec<u8>> {
 		// ffmpeg reads the elementary stream from a file rather than a pipe, so
 		// the test never has to drain its output while still writing its input.
-		let path = temp_path(name);
+		let path = temp_path(codec, name);
 		std::fs::write(&path, stream).expect("write the elementary stream");
 		let output = Command::new("ffmpeg")
 			.args(["-v", "error", "-i"])
@@ -969,8 +1081,8 @@ mod tests {
 	}
 
 	/// Asks ffprobe for the stream's `color_range,color_space`.
-	fn ffprobe_color(stream: &[u8]) -> Option<String> {
-		let path = temp_path("probe");
+	fn ffprobe_color(codec: Codec, stream: &[u8]) -> Option<String> {
+		let path = temp_path(codec, "probe");
 		std::fs::write(&path, stream).expect("write the elementary stream");
 		let output = Command::new("ffprobe")
 			.args([
@@ -1020,12 +1132,15 @@ mod tests {
 	}
 
 	/// Returns the NAL unit types in an Annex-B access unit.
-	fn nal_types(unit: &[u8]) -> Vec<u8> {
+	fn nal_types(codec: Codec, unit: &[u8]) -> Vec<u8> {
 		let mut types = Vec::new();
 		let mut i = 0;
 		while i + 3 < unit.len() {
 			if unit[i..i + 3] == [0, 0, 1] {
-				types.push(unit[i + 3] & 0x1f);
+				types.push(match codec {
+					Codec::H264 => unit[i + 3] & 0x1f,
+					Codec::H265 => (unit[i + 3] >> 1) & 0x3f,
+				});
 				i += 3;
 			}
 			i += 1;
@@ -1075,102 +1190,125 @@ mod tests {
 		DmaBuf::from_prime(surface.export_prime().expect("export the surface")).expect("one object")
 	}
 
-	/// With no node named, the encoder opens one that encodes H.264 and records
-	/// which. A named node is used or refused, never swapped for another.
+	/// With no node named, the encoder opens one that encodes its codec and
+	/// records which. A named node is used or refused, never swapped for another.
 	#[test]
 	fn the_render_node_is_found_or_named() {
-		let Some(encoder) = encoder(config()) else { return };
-		let device = encoder.config().device.clone().expect("the picked node is recorded");
-		let display = Display::open_drm_display(&device).expect("reopen the picked node");
-		probe(&display).expect("the picked node encodes H.264");
+		for codec in CODECS {
+			let Some(encoder) = encoder(config(codec)) else {
+				continue;
+			};
+			let device = encoder.config().device.clone().expect("the picked node is recorded");
+			let display = Display::open_drm_display(&device).expect("reopen the picked node");
+			probe(&display, codec).expect("the picked node encodes the codec");
 
-		let named = Config {
-			device: Some(PathBuf::from("/dev/null")),
-			..config()
-		};
-		assert!(
-			Encoder::new(named).is_err(),
-			"a named node that is not a render node was swapped for one that is"
-		);
+			let named = Config {
+				device: Some(PathBuf::from("/dev/null")),
+				..config(codec)
+			};
+			assert!(
+				Encoder::new(named).is_err(),
+				"a named node that is not a render node was swapped for one that is"
+			);
+		}
 	}
 
-	/// CPU NV12 in, H.264 out that an independent decoder reads back as the same picture.
+	/// CPU NV12 in, a stream out that an independent decoder reads back as the
+	/// same pictures, at a size that is whole coding blocks and at one that is not.
 	#[test]
 	fn nv12_round_trips_through_a_software_decoder() {
-		let Some(mut encoder) = encoder(config()) else { return };
-		let mut stream = Vec::new();
-		let mut frames = Vec::new();
-		for step in 0..10 {
-			let frame = nv12_frame(WIDTH, HEIGHT, step);
-			stream.extend(encoder.encode_nv12(&frame, false).expect("encode"));
-			frames.push(frame);
-		}
-		let Some(decoded) = ffmpeg_decode(&stream, "nv12") else {
-			return;
-		};
-		let len = frames[0].len();
-		assert_eq!(decoded.len(), len * frames.len(), "ffmpeg decoded a different count");
-		for (index, frame) in frames.iter().enumerate() {
-			let psnr = luma_psnr(frame, &decoded[index * len..], WIDTH, HEIGHT);
-			assert!(psnr > 35.0, "picture {index} decoded at {psnr:.1} dB");
+		for codec in CODECS {
+			for (width, height) in [(WIDTH, HEIGHT), (852, 478)] {
+				let Some(mut encoder) = encoder(Config {
+					width,
+					height,
+					..config(codec)
+				}) else {
+					continue;
+				};
+				let mut stream = Vec::new();
+				let mut frames = Vec::new();
+				for step in 0..10 {
+					let frame = nv12_frame(width, height, step);
+					stream.extend(encoder.encode_nv12(&frame, false).expect("encode"));
+					frames.push(frame);
+				}
+				let Some(decoded) = ffmpeg_decode(codec, &stream, "nv12") else {
+					return;
+				};
+				let len = frames[0].len();
+				assert_eq!(
+					decoded.len(),
+					len * frames.len(),
+					"{codec:?} at {width}x{height}: ffmpeg decoded a different count or size"
+				);
+				for (index, frame) in frames.iter().enumerate() {
+					let psnr = luma_psnr(frame, &decoded[index * len..], width, height);
+					assert!(
+						psnr > 35.0,
+						"{codec:?} at {width}x{height}: picture {index} decoded at {psnr:.1} dB"
+					);
+				}
+			}
 		}
 	}
 
 	/// The SPS names the color space the encoder was configured with.
 	#[test]
 	fn the_stream_is_labelled_with_its_color_space() {
-		for (config, expected) in [
-			(config(), "tv,smpte170m"),
-			(
-				Config {
-					color: Color::BT709,
-					..config()
-				},
-				"tv,bt709",
-			),
-		] {
-			let Some(mut encoder) = encoder(config) else { return };
-			let unit = encoder
-				.encode_nv12(&nv12_frame(WIDTH, HEIGHT, 0), true)
-				.expect("encode");
-			let Some(color) = ffprobe_color(&unit) else {
-				eprintln!("skipping: no ffprobe");
-				return;
-			};
-			assert_eq!(color, expected);
+		for codec in CODECS {
+			for (color, expected) in [(Color::BT601, "tv,smpte170m"), (Color::BT709, "tv,bt709")] {
+				let Some(mut encoder) = encoder(Config { color, ..config(codec) }) else {
+					break;
+				};
+				let unit = encoder
+					.encode_nv12(&nv12_frame(WIDTH, HEIGHT, 0), true)
+					.expect("encode");
+				let Some(found) = ffprobe_color(codec, &unit) else {
+					eprintln!("skipping: no ffprobe");
+					return;
+				};
+				assert_eq!(found, expected, "{codec:?}");
+			}
 		}
 	}
 
-	/// An IDR opens every group, and only there.
+	/// An IDR opens every group, and only there, carrying the parameter sets.
 	#[test]
 	fn keyframes_follow_the_group_length() {
-		let Some(mut encoder) = encoder(Config { gop: 10, ..config() }) else {
-			return;
-		};
-		for step in 0..25 {
-			let unit = encoder
-				.encode_nv12(&nv12_frame(WIDTH, HEIGHT, step), false)
-				.expect("encode");
-			let types = nal_types(&unit);
-			let idr = types.contains(&5);
-			assert_eq!(idr, step % 10 == 0, "frame {step} has NAL types {types:?}");
-			if idr {
-				assert!(
-					types.contains(&7) && types.contains(&8),
-					"an IDR carries its SPS and PPS"
+		for codec in CODECS {
+			let Some(mut encoder) = encoder(Config {
+				gop: 10,
+				..config(codec)
+			}) else {
+				continue;
+			};
+			let (idr_type, parameter_sets) = idr_types(codec);
+			for step in 0..25 {
+				let unit = encoder
+					.encode_nv12(&nv12_frame(WIDTH, HEIGHT, step), false)
+					.expect("encode");
+				let types = nal_types(codec, &unit);
+				let idr = types.contains(&idr_type);
+				assert_eq!(idr, step % 10 == 0, "{codec:?} frame {step} has NAL types {types:?}");
+				if idr {
+					assert!(
+						parameter_sets.iter().all(|kind| types.contains(kind)),
+						"a {codec:?} IDR carries its parameter sets: {types:?}"
+					);
+				}
+			}
+			// A forced keyframe restarts the count: the next IDR is a group later.
+			for step in 0..=10 {
+				let unit = encoder
+					.encode_nv12(&nv12_frame(WIDTH, HEIGHT, step), step == 0)
+					.expect("encode");
+				assert_eq!(
+					nal_types(codec, &unit).contains(&idr_type),
+					step % 10 == 0,
+					"{codec:?} frame {step} after the forced keyframe"
 				);
 			}
-		}
-		// A forced keyframe restarts the count: the next IDR is a group later.
-		for step in 0..=10 {
-			let unit = encoder
-				.encode_nv12(&nv12_frame(WIDTH, HEIGHT, step), step == 0)
-				.expect("encode");
-			assert_eq!(
-				nal_types(&unit).contains(&5),
-				step % 10 == 0,
-				"frame {step} after the forced keyframe"
-			);
 		}
 	}
 
@@ -1188,7 +1326,9 @@ mod tests {
 	/// CPU fallback can encode the same frame.
 	#[test]
 	fn a_refused_import_leaves_the_encoder_usable() {
-		let Some(mut encoder) = encoder(config()) else { return };
+		let Some(mut encoder) = encoder(config(Codec::H264)) else {
+			return;
+		};
 		let Some(display) = Display::open() else {
 			eprintln!("skipping: no VA-API display");
 			return;
@@ -1208,42 +1348,56 @@ mod tests {
 		let unit = encoder
 			.encode_nv12(&nv12_frame(WIDTH, HEIGHT, 0), true)
 			.expect("the CPU path still encodes");
-		let Some(decoded) = ffmpeg_decode(&unit, "refused") else {
+		let Some(decoded) = ffmpeg_decode(Codec::H264, &unit, "refused") else {
 			return;
 		};
 		let psnr = luma_psnr(&nv12_frame(WIDTH, HEIGHT, 0), &decoded, WIDTH, HEIGHT);
 		assert!(psnr > 35.0, "decoded at {psnr:.1} dB");
 	}
 
-	/// A 1080-row buffer is not encoded in place: the encoder reads 1088 rows,
-	/// so it goes through the video processor into the padded input surface.
+	/// A buffer short of whole coding blocks is not encoded in place: the
+	/// encoder reads whole blocks, so it goes through the video processor into
+	/// the padded input surface. That is 1080 rows for H.264, which reads 1088,
+	/// and 1076 for H.265, whose minimum coding blocks are 8 or 16 rows.
 	#[test]
-	fn a_buffer_short_of_whole_macroblocks_is_blitted() {
-		let (width, height) = (1920, 1080);
-		let Some(mut encoder) = encoder(Config::new(width, height, 30, 4_000_000, 30)) else {
-			return;
-		};
-		let Some(display) = Display::open() else {
-			eprintln!("skipping: no VA-API display");
-			return;
-		};
-		let unit = encoder
-			.encode_dmabuf(nv12_dmabuf(&display, (width, height), 0), true)
-			.expect("encode the DMA-BUF");
-		let Some(decoded) = ffmpeg_decode(&unit, "1080") else {
-			return;
-		};
-		let psnr = luma_psnr(&nv12_frame(width, height, 0), &decoded, width, height);
-		assert!(psnr > 35.0, "decoded at {psnr:.1} dB");
+	fn a_buffer_short_of_whole_coding_blocks_is_blitted() {
+		for (codec, (width, height)) in [(Codec::H264, (1920, 1080)), (Codec::H265, (1920, 1076))] {
+			let Some(mut encoder) = encoder(Config {
+				codec,
+				..Config::new(width, height, 30, 4_000_000, 30)
+			}) else {
+				continue;
+			};
+			let Some(display) = Display::open() else {
+				eprintln!("skipping: no VA-API display");
+				return;
+			};
+			let unit = encoder
+				.encode_dmabuf(nv12_dmabuf(&display, (width, height), 0), true)
+				.expect("encode the DMA-BUF");
+			let Some(decoded) = ffmpeg_decode(codec, &unit, "short") else {
+				return;
+			};
+			let frame = nv12_frame(width, height, 0);
+			assert_eq!(decoded.len(), frame.len(), "{codec:?} decoded at another size");
+			let psnr = luma_psnr(&frame, &decoded, width, height);
+			assert!(psnr > 35.0, "{codec:?} decoded at {psnr:.1} dB");
+		}
 	}
 
 	/// A YUV buffer labelled with another color space is converted into the
 	/// stream's, not relabelled.
 	#[test]
 	fn a_yuv_dmabuf_in_another_space_is_converted() {
+		for codec in CODECS {
+			yuv_dmabuf_in_another_space_is_converted(codec);
+		}
+	}
+
+	fn yuv_dmabuf_in_another_space_is_converted(codec: Codec) {
 		let Some(mut encoder) = encoder(Config {
 			color: Color::BT601,
-			..config()
+			..config(codec)
 		}) else {
 			return;
 		};
@@ -1276,7 +1430,7 @@ mod tests {
 			..DmaBuf::from_prime(surface.export_prime().expect("export")).expect("one object")
 		};
 		let unit = encoder.encode_dmabuf(buffer, true).expect("encode");
-		let Some(decoded) = ffmpeg_decode(&unit, "yuv-color") else {
+		let Some(decoded) = ffmpeg_decode(codec, &unit, "yuv-color") else {
 			return;
 		};
 
@@ -1291,7 +1445,7 @@ mod tests {
 		for (channel, (a, e)) in actual.iter().zip(expected).enumerate() {
 			assert!(
 				(a - e).abs() < 6.0,
-				"channel {channel}: decoded {a:.1}, expected BT.601 {e:.1}"
+				"{codec:?} channel {channel}: decoded {a:.1}, expected BT.601 {e:.1}"
 			);
 		}
 	}
@@ -1299,36 +1453,48 @@ mod tests {
 	/// An NV12 DMA-BUF at the encoder's size is encoded from the producer's memory.
 	#[test]
 	fn an_nv12_dmabuf_encodes_in_place() {
-		let Some(mut encoder) = encoder(config()) else { return };
-		let Some(display) = Display::open() else {
-			eprintln!("skipping: no VA-API display");
-			return;
-		};
-		let mut stream = Vec::new();
-		for step in 0..5 {
-			let buffer = nv12_dmabuf(&display, (WIDTH, HEIGHT), step);
-			stream.extend(encoder.encode_dmabuf(buffer, false).expect("encode the DMA-BUF"));
-		}
-		let Some(decoded) = ffmpeg_decode(&stream, "dmabuf") else {
-			return;
-		};
-		let len = nv12_frame(WIDTH, HEIGHT, 0).len();
-		assert_eq!(decoded.len(), 5 * len);
-		for step in 0..5 {
-			let psnr = luma_psnr(
-				&nv12_frame(WIDTH, HEIGHT, step),
-				&decoded[step as usize * len..],
-				WIDTH,
-				HEIGHT,
-			);
-			assert!(psnr > 35.0, "picture {step} decoded at {psnr:.1} dB");
+		for codec in CODECS {
+			let Some(mut encoder) = encoder(config(codec)) else {
+				continue;
+			};
+			let Some(display) = Display::open() else {
+				eprintln!("skipping: no VA-API display");
+				return;
+			};
+			let mut stream = Vec::new();
+			for step in 0..5 {
+				let buffer = nv12_dmabuf(&display, (WIDTH, HEIGHT), step);
+				stream.extend(encoder.encode_dmabuf(buffer, false).expect("encode the DMA-BUF"));
+			}
+			let Some(decoded) = ffmpeg_decode(codec, &stream, "dmabuf") else {
+				return;
+			};
+			let len = nv12_frame(WIDTH, HEIGHT, 0).len();
+			assert_eq!(decoded.len(), 5 * len, "{codec:?}");
+			for step in 0..5 {
+				let psnr = luma_psnr(
+					&nv12_frame(WIDTH, HEIGHT, step),
+					&decoded[step as usize * len..],
+					WIDTH,
+					HEIGHT,
+				);
+				assert!(psnr > 35.0, "{codec:?} picture {step} decoded at {psnr:.1} dB");
+			}
 		}
 	}
 
 	/// An NV12 DMA-BUF at another size is scaled to the encoder's on the GPU.
 	#[test]
 	fn a_dmabuf_at_another_size_is_scaled() {
-		let Some(mut encoder) = encoder(config()) else { return };
+		for codec in CODECS {
+			dmabuf_at_another_size_is_scaled(codec);
+		}
+	}
+
+	fn dmabuf_at_another_size_is_scaled(codec: Codec) {
+		let Some(mut encoder) = encoder(config(codec)) else {
+			return;
+		};
 		let Some(display) = Display::open() else {
 			eprintln!("skipping: no VA-API display");
 			return;
@@ -1338,11 +1504,11 @@ mod tests {
 			let buffer = nv12_dmabuf(&display, (WIDTH * 2, HEIGHT * 2), step);
 			stream.extend(encoder.encode_dmabuf(buffer, false).expect("encode the DMA-BUF"));
 		}
-		let Some(decoded) = ffmpeg_decode(&stream, "scaled") else {
+		let Some(decoded) = ffmpeg_decode(codec, &stream, "scaled") else {
 			return;
 		};
 		let len = nv12_frame(WIDTH, HEIGHT, 0).len();
-		assert_eq!(decoded.len(), 3 * len, "the output is at the encoder's size");
+		assert_eq!(decoded.len(), 3 * len, "{codec:?}: the output is at the encoder's size");
 		// Compare against the source scaled on the CPU by point sampling, which
 		// differs from the GPU filter only at edges. 25 dB separates a scale
 		// from a crop, which scores about 16 dB on this gradient.
@@ -1355,7 +1521,7 @@ mod tests {
 				}
 			}
 			let psnr = luma_psnr(&expected, &decoded[step as usize * len..], WIDTH, HEIGHT);
-			assert!(psnr > 25.0, "picture {step} decoded at {psnr:.1} dB");
+			assert!(psnr > 25.0, "{codec:?} picture {step} decoded at {psnr:.1} dB");
 		}
 	}
 
@@ -1364,9 +1530,12 @@ mod tests {
 	fn an_rgb_dmabuf_is_converted_to_the_configured_space() {
 		// Four flat quadrants, so the check reads colors rather than edges.
 		const QUADRANTS: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]];
-		for color in [Color::BT601, Color::BT709] {
-			let Some(mut encoder) = encoder(Config { color, ..config() }) else {
-				return;
+		for (codec, color) in CODECS
+			.into_iter()
+			.flat_map(|codec| [(codec, Color::BT601), (codec, Color::BT709)])
+		{
+			let Some(mut encoder) = encoder(Config { color, ..config(codec) }) else {
+				continue;
 			};
 			let Some(display) = Display::open() else {
 				eprintln!("skipping: no VA-API display");
@@ -1394,7 +1563,7 @@ mod tests {
 			let buffer = DmaBuf::from_prime(exported).expect("one object");
 			assert_eq!(buffer.drm_format, crate::dmabuf::drm::XRGB8888);
 			let unit = encoder.encode_dmabuf(buffer, false).expect("encode the RGB DMA-BUF");
-			let Some(decoded) = ffmpeg_decode(&unit, "rgb") else {
+			let Some(decoded) = ffmpeg_decode(codec, &unit, "rgb") else {
 				return;
 			};
 
@@ -1421,7 +1590,7 @@ mod tests {
 				for (channel, (a, e)) in actual.iter().zip(expected).enumerate() {
 					assert!(
 						(a - e).abs() < 6.0,
-						"{color:?} quadrant {quadrant} channel {channel}: decoded {a:.1}, expected {e:.1}"
+						"{codec:?} {color:?} quadrant {quadrant} channel {channel}: decoded {a:.1}, expected {e:.1}"
 					);
 				}
 			}
@@ -1456,9 +1625,19 @@ mod tests {
 	/// Lowering the bitrate mid-stream shrinks the pictures without an IDR.
 	#[test]
 	fn a_bitrate_change_takes_effect_without_a_keyframe() {
-		let Some(mut encoder) = encoder(Config::new(WIDTH, HEIGHT, 30, 2_000_000, 1_000)) else {
+		for codec in CODECS {
+			bitrate_change_takes_effect_without_a_keyframe(codec);
+		}
+	}
+
+	fn bitrate_change_takes_effect_without_a_keyframe(codec: Codec) {
+		let Some(mut encoder) = encoder(Config {
+			codec,
+			..Config::new(WIDTH, HEIGHT, 30, 2_000_000, 1_000)
+		}) else {
 			return;
 		};
+		let (idr_type, _) = idr_types(codec);
 		// The moving block over light noise: enough detail that 2 Mbps is
 		// spent, not so much that the quantizer bound decides the size instead
 		// of the rate controller.
@@ -1481,7 +1660,10 @@ mod tests {
 				.map(|step| {
 					let unit = encoder.encode_nv12(&frame(step), false).expect("encode");
 					if step > 0 {
-						assert!(!nal_types(&unit).contains(&5), "picture {step} is an IDR");
+						assert!(
+							!nal_types(codec, &unit).contains(&idr_type),
+							"{codec:?} picture {step} is an IDR"
+						);
 					}
 					unit.len()
 				})
@@ -1494,10 +1676,10 @@ mod tests {
 		assert_eq!(encoder.config().bitrate, 250_000);
 		assert!(encoder.set_bitrate(0).is_err(), "a zero bitrate is refused");
 		let low = average(&mut encoder, 60);
-		eprintln!("mean picture at 2 Mbps: {high} bytes, at 250 kbps: {low} bytes");
+		eprintln!("{codec:?} mean picture at 2 Mbps: {high} bytes, at 250 kbps: {low} bytes");
 		assert!(
 			low * 3 < high,
-			"the rate did not drop: {high} -> {low} bytes per picture"
+			"{codec:?}: the rate did not drop: {high} -> {low} bytes per picture"
 		);
 	}
 }
