@@ -4,7 +4,6 @@
 
 //! Wrappers and helpers around `VABuffer`s.
 
-#[cfg(libva_1_14_or_higher)]
 mod av1;
 mod enc_jpeg;
 mod enc_misc;
@@ -16,7 +15,6 @@ mod proc_pipeline;
 mod vp8;
 mod vp9;
 
-#[cfg(libva_1_14_or_higher)]
 pub use av1::*;
 pub use enc_jpeg::*;
 pub use enc_misc::*;
@@ -52,7 +50,6 @@ impl Buffer {
 		/* we send all slices parameters as a single array in H264, AV1 */
 		let nb_elements = match type_ {
 			BufferType::SliceParameter(SliceParameter::H264(ref mut params)) => params.inner_mut().len(),
-			#[cfg(libva_1_14_or_higher)]
 			BufferType::SliceParameter(SliceParameter::AV1(ref mut params)) => params.inner_mut().len(),
 			_ => 1,
 		};
@@ -87,7 +84,6 @@ impl Buffer {
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
 				),
-				#[cfg(libva_1_14_or_higher)]
 				PictureParameter::AV1(ref mut wrapper) => (
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
@@ -127,7 +123,6 @@ impl Buffer {
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
 				),
-				#[cfg(libva_1_14_or_higher)]
 				SliceParameter::AV1(ref mut wrapper) => (
 					wrapper.inner_mut().as_mut_ptr() as *mut std::ffi::c_void,
 					std::mem::size_of::<bindings::VASliceParameterBufferAV1>(),
@@ -196,7 +191,6 @@ impl Buffer {
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
 				),
-				#[cfg(libva_1_14_or_higher)]
 				EncSequenceParameter::AV1(ref mut wrapper) => (
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
@@ -220,7 +214,6 @@ impl Buffer {
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
 				),
-				#[cfg(libva_1_14_or_higher)]
 				EncPictureParameter::AV1(ref mut wrapper) => (
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
@@ -236,7 +229,6 @@ impl Buffer {
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
 				),
-				#[cfg(libva_1_14_or_higher)]
 				EncSliceParameter::AV1(ref mut wrapper) => (
 					wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
 					std::mem::size_of_val(wrapper.inner_mut()),
@@ -427,7 +419,6 @@ pub enum PictureParameter {
 	HEVCRext(hevc::PictureParameterBufferHEVCRext),
 	/// Wrapper over VAPictureParameterBufferHEVCScc
 	HEVCScc(hevc::PictureParameterBufferHEVCScc),
-	#[cfg(libva_1_14_or_higher)]
 	/// Wrapper over VADecPictureParameterBufferAV1
 	AV1(av1::PictureParameterBufferAV1),
 	/// Wrapper over VAPictureParameterBufferJPEGBaseline
@@ -450,7 +441,6 @@ pub enum SliceParameter {
 	HEVC(hevc::SliceParameterBufferHEVC),
 	/// Wrapper over VASliceParameterBufferHEVCRext
 	HEVCRext(hevc::SliceParameterBufferHEVCRext),
-	#[cfg(libva_1_14_or_higher)]
 	/// Wrapper over VASliceParameterBufferAV1
 	AV1(av1::SliceParameterBufferAV1),
 	/// Wrapper over VASliceParameterBufferJPEGBaseline
@@ -495,7 +485,6 @@ pub enum EncSequenceParameter {
 	VP8(vp8::EncSequenceParameterBufferVP8),
 	/// Abstraction over `VAEncSequenceParameterBufferVP9`
 	VP9(vp9::EncSequenceParameterBufferVP9),
-	#[cfg(libva_1_14_or_higher)]
 	/// Abstraction over `VAEncSequenceParameterBufferAV1`
 	AV1(av1::EncSequenceParameterBufferAV1),
 }
@@ -510,7 +499,6 @@ pub enum EncPictureParameter {
 	VP8(vp8::EncPictureParameterBufferVP8),
 	/// Abstraction over `VAEncPictureParameterBufferVP9`
 	VP9(vp9::EncPictureParameterBufferVP9),
-	#[cfg(libva_1_14_or_higher)]
 	/// Abstraction over `VAEncPictureParameterBufferAV1`
 	AV1(av1::EncPictureParameterBufferAV1),
 }
@@ -521,7 +509,6 @@ pub enum EncSliceParameter {
 	H264(h264::EncSliceParameterBufferH264),
 	/// Abstraction over `VAEncSliceParameterBufferHEVC`
 	HEVC(hevc::EncSliceParameterBufferHEVC),
-	#[cfg(libva_1_14_or_higher)]
 	/// Abstraction over `VAEncTileGroupBufferAV1`
 	AV1(av1::EncTileGroupBufferAV1),
 }

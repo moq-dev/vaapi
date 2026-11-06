@@ -15,7 +15,9 @@
 // bare URLs and other rustdoc-unfriendly markup. Don't lint generated docs.
 #![allow(rustdoc::all)]
 
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+// Generated from the vendored headers by `just bindgen` and checked in, so a
+// build needs neither bindgen nor libclang.
+include!("bindings/libva.rs");
 
 use std::sync::OnceLock;
 

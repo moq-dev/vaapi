@@ -133,7 +133,6 @@ impl EncMiscParameterRateControl {
 				ICQ_quality_factor: icq_quality_factor,
 				max_qp,
 				quality_factor,
-				#[cfg(libva_1_10_or_higher)]
 				target_frame_size,
 				..Default::default()
 			},
