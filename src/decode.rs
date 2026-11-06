@@ -6,31 +6,37 @@
 // `decoder/stateless/h264/vaapi.rs`), itself BSD-3-Clause / Copyright The
 // ChromiumOS Authors. See LICENSE.cros-codecs.
 
-//! Thin VA-API H.264 decoder built on the vendored libva binding.
+//! Thin VA-API H.264 and H.265 decoder built on the vendored libva binding.
 //!
 //! The mirror of [`crate::encode`]. It reuses the backend-agnostic bitstream
-//! layer ([`crate::codec::h264`]) from discord/cros-codecs (BSD-3-Clause) for
-//! SPS/PPS/slice parsing, reference marking, and DPB bumping, then drives libva
-//! directly rather than vendoring cros-codecs's generic multi-backend decoder
-//! framework. The per-picture and per-slice VA buffer population is ported from
-//! cros-codecs's `decoder/stateless/h264/vaapi.rs`.
+//! layers ([`crate::codec::h264`], [`crate::codec::h265`]) from
+//! discord/cros-codecs (BSD-3-Clause) for parameter set and slice parsing,
+//! reference marking, and DPB bumping, then drives libva directly rather than
+//! vendoring cros-codecs's generic multi-backend decoder framework. The
+//! per-picture and per-slice VA buffer population is ported from cros-codecs's
+//! `decoder/stateless/h264/vaapi.rs` and, in `h265.rs`, from
+//! `decoder/stateless/h265.rs` and `decoder/stateless/h265/vaapi.rs`.
 //!
 //! Feed [`Decoder::decode`] one Annex-B access unit at a time. Its picture is
 //! submitted and completed before the call returns, rather than when the next
 //! unit's first slice arrives, so the hardware is never left holding a
 //! half-submitted picture between calls.
 //!
-//! Output trails input, and by more than the stream's reorder depth: C.4.5.3
-//! bumps the DPB only when a new picture needs the slot, so the delay follows
-//! the sequence's reference and reorder limits. A stream coded with three
-//! reference frames trails by three pictures whether or not it uses B-frames.
-//! [`Frame`] therefore carries the timestamp of the access unit it was coded in,
-//! and [`Decoder::flush`] is what releases the tail at the end of a stream.
+//! H.264 output trails input, and by more than the stream's reorder depth:
+//! C.4.5.3 bumps the DPB only when a new picture needs the slot, so the delay
+//! follows the sequence's reference and reorder limits. A stream coded with
+//! three reference frames trails by three pictures whether or not it uses
+//! B-frames. H.265 bumps by the SPS's reorder limit (C.5.2), so a stream with
+//! no reordering comes out as it decodes. [`Frame`] therefore carries the
+//! timestamp of the access unit it was coded in, and [`Decoder::flush`] is what
+//! releases the tail at the end of a stream.
 //!
 //! Progressive 8-bit 4:2:0 only: a sequence that is interlaced, deeper than 8
 //! bits, or not 4:2:0 is rejected rather than decoded wrongly. That covers every
 //! stream this crate's encoder, WebRTC, or a browser's `VideoEncoder` produces.
-//! Left and top cropping are rejected; right and bottom cropping are supported.
+//! H.265 is the Main profile, with Main 10 and Main Still Picture streams that
+//! hold 8-bit samples decoded the same way. Left and top cropping are rejected;
+//! right and bottom cropping are supported.
 
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -45,6 +51,7 @@ use crate::codec::h264::parser::{
 	SliceType, Sps,
 };
 use crate::codec::h264::picture::{Field, IsIdr, PictureData, Reference};
+use crate::codec::Codec;
 use crate::pool::{PooledSurface, SurfacePool};
 use crate::{
 	bindings, Buffer, BufferType, Config as VaConfig, Context, Display, DrmPrimeSurfaceDescriptor, H264PicFields,
@@ -55,19 +62,27 @@ use crate::{
 	VA_SLICE_DATA_FLAG_ALL,
 };
 
-/// H.264 decoder configuration.
+mod h265;
+
+/// Decoder configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
+	/// The format to decode, H.264 unless set.
+	pub codec: Codec,
 	/// DRM render node to open (e.g. `/dev/dri/renderD128`).
 	///
-	/// `None`, the default, opens the first node whose driver can decode H.264.
+	/// `None`, the default, opens the first node whose driver can decode
+	/// [`codec`](Self::codec).
 	pub device: Option<PathBuf>,
 }
 
 impl Config {
-	/// Returns a configuration that opens the first render node whose driver can decode H.264.
+	/// Returns an H.264 configuration that opens the first render node whose driver can decode it.
 	pub fn new() -> Self {
-		Self { device: None }
+		Self {
+			codec: Codec::H264,
+			device: None,
+		}
 	}
 }
 
@@ -212,7 +227,7 @@ impl std::fmt::Debug for Frame {
 	}
 }
 
-/// A VA-API H.264 decoder. Built once, fed Annex-B access units, emits NV12.
+/// A VA-API H.264 or H.265 decoder. Built once, fed Annex-B access units, emits NV12.
 ///
 /// # Examples
 ///
@@ -234,6 +249,18 @@ impl std::fmt::Debug for Frame {
 /// # }
 /// ```
 pub struct Decoder {
+	inner: Inner,
+}
+
+/// The decoder for each format. They share the VA plumbing: [`Sequence`],
+/// [`Handle`], and the read-back and export of a decoded picture.
+enum Inner {
+	H264(H264),
+	H265(h265::Decoder),
+}
+
+/// The H.264 decoder.
+struct H264 {
 	parser: Parser,
 	dpb: Dpb<Handle>,
 	/// Cached variables from the previous reference picture.
@@ -251,38 +278,34 @@ pub struct Decoder {
 }
 
 impl Decoder {
-	/// Opens [`Config::device`], or the first render node that decodes H.264,
-	/// and checks that the driver exposes an H.264 decode entrypoint.
+	/// Opens [`Config::device`], or the first render node that decodes
+	/// [`Config::codec`], and checks that the driver exposes a decode
+	/// entrypoint for it.
 	///
 	/// The VA config, context, and surface pool are built later, from the first
 	/// SPS, since their profile and size come from the stream. This still fails
 	/// early enough for a caller to fall back to another decoder when libva is
-	/// missing, the node cannot be opened, or the driver decodes no H.264. A
-	/// named node is never swapped for another.
+	/// missing, the node cannot be opened, or the driver does not decode the
+	/// codec. A named node is never swapped for another.
 	pub fn new(config: Config) -> anyhow::Result<Self> {
+		let codec = config.codec;
 		let (device, display) = match config.device {
 			Some(device) => {
 				let display =
 					Display::open_drm_display(&device).map_err(|e| anyhow!("open DRM display {device:?}: {e:?}"))?;
-				probe(&display)?;
+				probe(&display, codec)?;
 				(device, display)
 			}
-			None => {
-				crate::display::open_first(probe).map_err(|e| e.context("find a render node that decodes H.264"))?
-			}
+			None => crate::display::open_first(|display| probe(display, codec))
+				.map_err(|e| e.context(format!("find a render node that decodes {codec:?}")))?,
 		};
 
-		log::info!("opened VA-API H.264 decoder on {device:?}");
-		Ok(Self {
-			parser: Parser::default(),
-			dpb: Dpb::default(),
-			prev_ref_pic_info: PrevReferencePicInfo::default(),
-			prev_pic_info: PrevPicInfo::default(),
-			max_long_term_frame_idx: MaxLongTermFrameIdx::default(),
-			sequence: None,
-			ready: Vec::new(),
-			display,
-		})
+		log::info!("opened VA-API {codec:?} decoder on {device:?}");
+		let inner = match codec {
+			Codec::H264 => Inner::H264(H264::new(display)),
+			Codec::H265 => Inner::H265(h265::Decoder::new(display)),
+		};
+		Ok(Self { inner })
 	}
 
 	/// Decodes one Annex-B access unit, returning the pictures that came due, in
@@ -324,6 +347,98 @@ impl Decoder {
 	/// queue for whichever of [`Decoder::take_frames`] or
 	/// [`Decoder::take_exported`] the caller asked for.
 	fn submit(&mut self, access_unit: &[u8], timestamp: u64) -> anyhow::Result<()> {
+		let nalus = match &mut self.inner {
+			Inner::H264(decoder) => decoder.submit(access_unit, timestamp)?,
+			Inner::H265(decoder) => decoder.submit(access_unit, timestamp)?,
+		};
+
+		// A decoder cannot tell a truncated unit from a complete one, so a
+		// caller that hands us the wrong container gets silence. Say so once per
+		// unit rather than leaving them to wonder where their pictures went.
+		if nalus == 0 && !access_unit.is_empty() {
+			log::warn!(
+				"access unit of {} bytes holds no Annex-B NAL unit; length-prefixed input has to be converted first",
+				access_unit.len()
+			);
+		}
+		Ok(())
+	}
+
+	/// Returns every picture still held in the DPB, in output order.
+	///
+	/// The DPB lets a picture out only when a later one needs it to (C.4.5.3
+	/// for H.264, C.5.2 for H.265), so a stream that simply stops leaves its
+	/// tail sitting there. This releases that tail and empties the DPB, so a
+	/// second call returns nothing.
+	///
+	/// The parsed parameter sets survive, and nothing here waits for an IDR: a
+	/// stream picked up part way through decodes against an empty DPB, which
+	/// gives distorted pictures until its next IDR rather than an error.
+	pub fn flush(&mut self) -> anyhow::Result<Vec<Frame>> {
+		self.reset();
+		self.take_frames()
+	}
+
+	/// [`Decoder::flush`] for a caller taking its pictures on the GPU.
+	pub fn flush_exported(&mut self) -> anyhow::Result<Vec<ExportedFrame>> {
+		self.reset();
+		self.take_exported()
+	}
+
+	/// Moves the DPB to the ready queue and forgets the state the next picture
+	/// would otherwise be derived against.
+	fn reset(&mut self) {
+		match &mut self.inner {
+			Inner::H264(decoder) => decoder.reset(),
+			Inner::H265(decoder) => decoder.reset(),
+		}
+	}
+
+	/// The pictures bumped out of the DPB, in output order, awaiting download.
+	fn ready(&mut self) -> &mut Vec<Handle> {
+		match &mut self.inner {
+			Inner::H264(decoder) => &mut decoder.ready,
+			Inner::H265(decoder) => &mut decoder.ready,
+		}
+	}
+
+	/// Downloads every picture waiting in the ready queue.
+	fn take_frames(&mut self) -> anyhow::Result<Vec<Frame>> {
+		std::mem::take(self.ready()).iter().map(download).collect()
+	}
+
+	/// Exports every picture waiting in the ready queue, leaving the pixels
+	/// where the hardware wrote them.
+	fn take_exported(&mut self) -> anyhow::Result<Vec<ExportedFrame>> {
+		std::mem::take(self.ready()).iter().map(export).collect()
+	}
+
+	/// The VA state of the active sequence, for tests that look at its pool.
+	#[cfg(test)]
+	fn sequence(&self) -> Option<&Sequence> {
+		match &self.inner {
+			Inner::H264(decoder) => decoder.sequence.as_ref(),
+			Inner::H265(decoder) => decoder.sequence.as_ref(),
+		}
+	}
+}
+
+impl H264 {
+	fn new(display: Arc<Display>) -> Self {
+		Self {
+			parser: Parser::default(),
+			dpb: Dpb::default(),
+			prev_ref_pic_info: PrevReferencePicInfo::default(),
+			prev_pic_info: PrevPicInfo::default(),
+			max_long_term_frame_idx: MaxLongTermFrameIdx::default(),
+			sequence: None,
+			ready: Vec::new(),
+			display,
+		}
+	}
+
+	/// Decodes one access unit into the ready queue, returning how many NAL units it held.
+	fn submit(&mut self, access_unit: &[u8], timestamp: u64) -> anyhow::Result<usize> {
 		let mut cursor = Cursor::new(access_unit);
 		let mut current: Option<CurrentPicture> = None;
 		let mut nalus = 0usize;
@@ -369,43 +484,13 @@ impl Decoder {
 			}
 		}
 
-		// Since the loop cannot tell a truncated unit from a complete one, a
-		// caller that hands us the wrong container gets silence. Say so once per
-		// unit rather than leaving them to wonder where their pictures went.
-		if nalus == 0 && !access_unit.is_empty() {
-			log::warn!(
-				"access unit of {} bytes holds no Annex-B NAL unit; length-prefixed input has to be converted first",
-				access_unit.len()
-			);
-		}
-
 		// Finishing here rather than on the next unit's first slice keeps the
 		// hardware from holding a half-submitted picture between calls.
 		if let Some(picture) = current.take() {
 			self.finish_picture(picture)?;
 		}
 
-		Ok(())
-	}
-
-	/// Returns every picture still held in the DPB, in output order.
-	///
-	/// C.4.5.3 bumps the DPB only when a new picture needs the slot, so a stream
-	/// that simply stops leaves its tail sitting there. This releases that tail
-	/// and empties the DPB, so a second call returns nothing.
-	///
-	/// The parsed parameter sets survive, and nothing here waits for an IDR: a
-	/// stream picked up part way through decodes against an empty DPB, which
-	/// gives distorted pictures until its next IDR rather than an error.
-	pub fn flush(&mut self) -> anyhow::Result<Vec<Frame>> {
-		self.reset();
-		self.take_frames()
-	}
-
-	/// [`Decoder::flush`] for a caller taking its pictures on the GPU.
-	pub fn flush_exported(&mut self) -> anyhow::Result<Vec<ExportedFrame>> {
-		self.reset();
-		self.take_exported()
+		Ok(nalus)
 	}
 
 	/// Moves the DPB to the ready queue and forgets the order count state the
@@ -415,17 +500,6 @@ impl Decoder {
 		self.prev_ref_pic_info = PrevReferencePicInfo::default();
 		self.prev_pic_info = PrevPicInfo::default();
 		self.max_long_term_frame_idx = MaxLongTermFrameIdx::default();
-	}
-
-	/// Downloads every picture waiting in the ready queue.
-	fn take_frames(&mut self) -> anyhow::Result<Vec<Frame>> {
-		std::mem::take(&mut self.ready).iter().map(download).collect()
-	}
-
-	/// Exports every picture waiting in the ready queue, leaving the pixels
-	/// where the hardware wrote them.
-	fn take_exported(&mut self) -> anyhow::Result<Vec<ExportedFrame>> {
-		std::mem::take(&mut self.ready).iter().map(export).collect()
 	}
 
 	/// Moves everything left in the DPB to the ready queue.
@@ -448,7 +522,14 @@ impl Decoder {
 		};
 		self.dpb.set_limits(max_dpb_frames, max_num_reorder_frames);
 
-		if self.sequence.as_ref().map(|sequence| &sequence.info) == Some(&info) {
+		let format = Format {
+			codec: Codec::H264,
+			profile: va_profile(sps)?,
+			coded: info.coded,
+			visible: info.visible,
+			max_dpb_frames: info.max_dpb_frames,
+		};
+		if self.sequence.as_ref().map(|sequence| &sequence.format) == Some(&format) {
 			return Ok(());
 		}
 
@@ -457,7 +538,7 @@ impl Decoder {
 		// through them the old pool) alive until they are downloaded.
 		self.drain();
 
-		self.sequence = Some(Sequence::new(&self.display, sps, info)?);
+		self.sequence = Some(Sequence::new(&self.display, format)?);
 		Ok(())
 	}
 
@@ -489,12 +570,7 @@ impl Decoder {
 		// `apply_sps` above either kept the sequence or built a new one.
 		let sequence = self.sequence.as_ref().expect("sequence built by apply_sps");
 		let context = Rc::clone(&sequence.context);
-		let handle = Handle {
-			surface: Arc::new(sequence.pool.alloc()?),
-			timestamp,
-			width: sequence.width,
-			height: sequence.height,
-		};
+		let handle = sequence.handle(timestamp)?;
 
 		let mut picture = Picture::new(timestamp, Rc::clone(&context), handle.clone());
 		let pic_param = build_pic_param(&slice.header, &pic, handle.surface.id(), &self.dpb, &sps, &pps);
@@ -566,13 +642,7 @@ impl Decoder {
 			..
 		} = current;
 
-		let picture = picture.begin::<()>().map_err(|e| anyhow!("picture begin: {e:?}"))?;
-		let picture = picture.render().map_err(|e| anyhow!("picture render: {e:?}"))?;
-		let picture = picture.end().map_err(|e| anyhow!("picture end: {e:?}"))?;
-		// Sync before the surface enters the DPB: it is about to be read as a
-		// reference by later pictures, and the caller may never ask for its
-		// pixels. Dropping the synced picture frees the VA buffers with it.
-		drop(picture.sync::<()>().map_err(|(e, _)| anyhow!("picture sync: {e:?}"))?);
+		run(picture)?;
 		log::trace!("decoded picture POC {}", pic.pic_order_cnt);
 
 		if pic.is_ref() {
@@ -1129,13 +1199,22 @@ impl SequenceInfo {
 	}
 }
 
+/// What the VA config, context, and surface pool of a sequence are built for.
+/// A change in any of it rebuilds them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Format {
+	codec: Codec,
+	profile: VAProfile::Type,
+	coded: (u32, u32),
+	/// The size after cropping, which is what a [`Frame`] reports.
+	visible: (u32, u32),
+	/// The most pictures the DPB holds, which bounds what the pool keeps free.
+	max_dpb_frames: usize,
+}
+
 /// The VA state for one coded video sequence.
 struct Sequence {
-	info: SequenceInfo,
-	/// Visible width after cropping, which is what a [`Frame`] reports.
-	width: u32,
-	/// Visible height after cropping.
-	height: u32,
+	format: Format,
 	pool: SurfacePool,
 	// Drop order: the context must go before the config it was created from.
 	context: Rc<Context>,
@@ -1143,48 +1222,70 @@ struct Sequence {
 }
 
 impl Sequence {
-	fn new(display: &Arc<Display>, sps: &Sps, info: SequenceInfo) -> anyhow::Result<Self> {
-		let (width, height) = info.visible;
-
+	fn new(display: &Arc<Display>, format: Format) -> anyhow::Result<Self> {
 		let attrs = vec![VAConfigAttrib {
 			type_: VAConfigAttribType::VAConfigAttribRTFormat,
 			value: VA_RT_FORMAT_YUV420,
 		}];
 		let config = display
-			.create_config(attrs, va_profile(sps)?, VAEntrypoint::VAEntrypointVLD)
+			.create_config(attrs, format.profile, VAEntrypoint::VAEntrypointVLD)
 			.map_err(|e| anyhow!("create VA config: {e:?}"))?;
 
-		let (coded_width, coded_height) = info.coded;
+		let (coded_width, coded_height) = format.coded;
 		let context = display
 			.create_context::<()>(&config, coded_width, coded_height, None, true)
 			.map_err(|e| anyhow!("create VA context: {e:?}"))?;
 
+		let (width, height) = format.visible;
 		log::info!(
-			"VA-API H.264 sequence: {width}x{height} visible, {coded_width}x{coded_height} coded, \
-			 profile_idc {}, DPB {} frames",
-			sps.profile_idc,
-			info.max_dpb_frames
+			"VA-API {:?} sequence: {width}x{height} visible, {coded_width}x{coded_height} coded, \
+			 VA profile {}, DPB {} frames",
+			format.codec,
+			format.profile,
+			format.max_dpb_frames
 		);
 
 		// What the decoder itself can need at once: a full DPB plus the picture
 		// being decoded. Anything free beyond that was let go by a consumer that
 		// had been holding pictures, and is memory the stream will not ask for
 		// again.
-		let capacity = info.max_dpb_frames + 1;
+		let capacity = format.max_dpb_frames + 1;
 		Ok(Self {
-			info,
-			width,
-			height,
 			pool: SurfacePool::new(
 				display,
 				(coded_width, coded_height),
 				UsageHint::USAGE_HINT_DECODER,
 				capacity,
 			),
+			format,
 			context,
 			_config: config,
 		})
 	}
+
+	/// Returns a surface to decode a picture coded at `timestamp` into.
+	fn handle(&self, timestamp: u64) -> anyhow::Result<Handle> {
+		let (width, height) = self.format.visible;
+		Ok(Handle {
+			surface: Arc::new(self.pool.alloc()?),
+			timestamp,
+			width,
+			height,
+		})
+	}
+}
+
+/// Submits a picture with all its buffers added, and waits for it to decode.
+///
+/// The wait comes before the surface enters the DPB: it is about to be read as
+/// a reference by later pictures, and the caller may never ask for its pixels.
+/// Dropping the synced picture frees the VA buffers with it.
+fn run(picture: Picture<crate::PictureNew, Handle>) -> anyhow::Result<()> {
+	let picture = picture.begin::<()>().map_err(|e| anyhow!("picture begin: {e:?}"))?;
+	let picture = picture.render().map_err(|e| anyhow!("picture render: {e:?}"))?;
+	let picture = picture.end().map_err(|e| anyhow!("picture end: {e:?}"))?;
+	drop(picture.sync::<()>().map_err(|(e, _)| anyhow!("picture sync: {e:?}"))?);
+	Ok(())
 }
 
 /// Exports a decoded surface as a DRM PRIME descriptor, copying nothing.
@@ -1296,26 +1397,28 @@ fn copy_plane(
 	Ok(())
 }
 
-/// Checks that `display`'s driver can decode H.264, which is what [`Decoder::new`] needs of a render node.
+/// Checks that `display`'s driver can decode `codec`, which is what [`Decoder::new`] needs of a render node.
 ///
 /// # Errors
 ///
 /// Fails unless the driver offers `VAEntrypointVLD` for a Constrained
-/// Baseline, Main, or High profile, or when it cannot be asked.
-pub fn probe(display: &Display) -> anyhow::Result<()> {
+/// Baseline, Main, or High profile (H.264) or for the Main profile (H.265),
+/// or when it cannot be asked.
+pub fn probe(display: &Display, codec: Codec) -> anyhow::Result<()> {
 	let profiles = display
 		.query_config_profiles()
 		.map_err(|e| anyhow!("query VA profiles: {e:?}"))?;
 
 	let supported = profiles
 		.into_iter()
-		.filter(|profile| {
-			matches!(
+		.filter(|profile| match codec {
+			Codec::H264 => matches!(
 				*profile,
 				VAProfile::VAProfileH264ConstrainedBaseline
 					| VAProfile::VAProfileH264Main
 					| VAProfile::VAProfileH264High
-			)
+			),
+			Codec::H265 => *profile == VAProfile::VAProfileHEVCMain,
 		})
 		.any(|profile| {
 			display
@@ -1324,7 +1427,7 @@ pub fn probe(display: &Display) -> anyhow::Result<()> {
 		});
 
 	if !supported {
-		bail!("driver exposes no H.264 decode entrypoint");
+		bail!("driver exposes no {codec:?} decode entrypoint");
 	}
 
 	Ok(())
@@ -1826,6 +1929,7 @@ mod tests {
 		}
 		let named = Config {
 			device: Some(PathBuf::from("/dev/null")),
+			..Config::new()
 		};
 		assert!(
 			Decoder::new(named).is_err(),
@@ -1922,7 +2026,7 @@ mod tests {
 		}
 		assert!(compared > 0, "the decoder produced no pictures");
 
-		let pool = &exporting.sequence.as_ref().expect("a sequence").pool;
+		let pool = &exporting.sequence().expect("a sequence").pool;
 		let allocated = pool.allocated.get();
 		eprintln!("{allocated} surfaces allocated for {PICTURES} exported pictures");
 		assert!(
@@ -1960,7 +2064,7 @@ mod tests {
 		for _ in 0..HELD {
 			held.extend(decode(&mut decoder));
 		}
-		let pool = &decoder.sequence.as_ref().expect("a sequence").pool;
+		let pool = &decoder.sequence().expect("a sequence").pool;
 		let allocated = pool.allocated.get();
 		assert!(
 			allocated >= held.len(),
@@ -1979,7 +2083,7 @@ mod tests {
 		for _ in 0..10 {
 			drop(decode(&mut decoder));
 		}
-		let pool = &decoder.sequence.as_ref().expect("a sequence").pool;
+		let pool = &decoder.sequence().expect("a sequence").pool;
 		assert_eq!(
 			pool.allocated.get(),
 			allocated,
@@ -2048,99 +2152,150 @@ mod tests {
 		}
 	}
 
-	/// Decoded pictures match ffmpeg's software decoder byte for byte, in the
-	/// order both put them out.
+	/// Every picture matches what ffmpeg's software decoder makes of the same
+	/// stream, bit for bit, in either codec.
 	///
-	/// The test that says this is a decoder rather than plumbing. The stream is
-	/// coded with B-frames and three reference frames, so matching the reference
-	/// means the reference lists, the picture order counts, and the DPB bumping
-	/// are all right, not just the surfaces. Skips without ffmpeg or a device.
+	/// The test that says this is a decoder rather than plumbing. The streams
+	/// are coded with B-frames and three reference frames, so matching the
+	/// reference means the reference lists, the picture order counts, and the
+	/// DPB bumping are all right, not just the surfaces. The second size crops
+	/// on the right and bottom. Half the pictures are taken as descriptors and
+	/// downloaded after, so both ways out are checked. Skips without ffmpeg,
+	/// its encoder, or a device.
 	#[test]
 	fn decoded_pictures_match_a_software_decoder() {
-		const WIDTH: u32 = 320;
-		const HEIGHT: u32 = 240;
 		const PICTURES: usize = 30;
 
-		let Some(stream) = ffmpeg(&[
-			"-f",
-			"lavfi",
-			"-i",
-			&format!("testsrc2=size={WIDTH}x{HEIGHT}:rate=30"),
-			"-frames:v",
-			&PICTURES.to_string(),
-			"-c:v",
-			"libx264",
-			"-profile:v",
-			"main",
-			"-bf",
-			"2",
-			"-refs",
-			"3",
-			"-g",
-			"15",
-			"-pix_fmt",
-			"yuv420p",
-			"-f",
-			"h264",
-			"-",
-		]) else {
-			eprintln!("skipping: no ffmpeg with libx264");
+		for codec in [Codec::H264, Codec::H265] {
+			for (width, height) in [(320u32, 240u32), (852, 478)] {
+				let Some(stream) = software_encode(codec, (width, height), PICTURES, true) else {
+					eprintln!("skipping: no ffmpeg that encodes {codec:?}");
+					continue;
+				};
+				let reference = software_decode(codec, &stream);
+
+				let picture_len = (width * height * 3 / 2) as usize;
+				assert_eq!(
+					reference.len(),
+					PICTURES * picture_len,
+					"ffmpeg decoded a different count"
+				);
+
+				let Ok(mut decoder) = Decoder::new(Config { codec, ..Config::new() }) else {
+					eprintln!("skipping: no VA-API {codec:?} decoder");
+					continue;
+				};
+
+				let units = split_access_units(codec, &stream);
+				let mut decoded = Vec::new();
+				for (index, unit) in units.iter().enumerate() {
+					if index % 2 == 0 {
+						decoded.extend(decoder.decode(unit, index as u64).expect("decode an access unit"));
+					} else {
+						for exported in decoder
+							.decode_exported(unit, index as u64)
+							.expect("decode an access unit")
+						{
+							decoded.push(exported.download().expect("download an exported picture"));
+						}
+					}
+				}
+				decoded.extend(decoder.flush().expect("flush the decoder"));
+				assert_eq!(decoded.len(), PICTURES, "{codec:?} lost or invented pictures");
+
+				let mut timestamps: Vec<u64> = decoded.iter().map(|picture| picture.timestamp).collect();
+				assert!(
+					timestamps.windows(2).any(|pair| pair[0] > pair[1]),
+					"the {codec:?} stream came out in decode order, so nothing here tests reordering"
+				);
+				timestamps.sort_unstable();
+				assert_eq!(
+					timestamps,
+					(0..PICTURES as u64).collect::<Vec<_>>(),
+					"a {codec:?} picture's timestamp did not survive reordering"
+				);
+
+				for (index, picture) in decoded.iter().enumerate() {
+					assert_eq!((picture.width, picture.height), (width, height));
+					assert!(
+						picture.data == reference[index * picture_len..][..picture_len],
+						"{codec:?} picture {index} of {PICTURES} at {width}x{height} differs from the software decoder"
+					);
+				}
+			}
+		}
+	}
+
+	/// An H.265 stream coded without reordering comes out as it decodes: C.5.2
+	/// bumps by the SPS's reorder limit, which is zero, rather than holding
+	/// pictures until the DPB fills the way H.264's C.4.5.3 does.
+	#[test]
+	fn h265_without_reordering_comes_out_as_it_decodes() {
+		const PICTURES: usize = 10;
+
+		let Some(stream) = software_encode(Codec::H265, (320, 240), PICTURES, false) else {
+			eprintln!("skipping: no ffmpeg that encodes H.265");
+			return;
+		};
+		let Ok(mut decoder) = Decoder::new(Config {
+			codec: Codec::H265,
+			..Config::new()
+		}) else {
+			eprintln!("skipping: no VA-API H.265 decoder");
 			return;
 		};
 
-		// ffmpeg reads the elementary stream from a file rather than a pipe, so
-		// the test never has to drain its output while still writing its input.
-		let path = std::env::temp_dir().join(format!("moq-vaapi-decode-{}.264", std::process::id()));
-		std::fs::write(&path, &stream).expect("write the elementary stream");
-		let reference = ffmpeg(&[
-			"-i",
-			path.to_str().expect("a UTF-8 temporary path"),
-			"-pix_fmt",
-			"nv12",
-			"-f",
-			"rawvideo",
-			"-",
-		]);
-		let _ = std::fs::remove_file(&path);
-		let reference = reference.expect("ffmpeg decodes what it just encoded");
+		for (index, unit) in split_access_units(Codec::H265, &stream).iter().enumerate() {
+			let decoded = decoder.decode(unit, index as u64).expect("decode an access unit");
+			let timestamps: Vec<u64> = decoded.iter().map(|picture| picture.timestamp).collect();
+			assert_eq!(timestamps, [index as u64], "access unit {index} was held back");
+		}
+		assert!(decoder.flush().expect("flush the decoder").is_empty());
+	}
 
-		let picture_len = (WIDTH * HEIGHT * 3 / 2) as usize;
-		assert_eq!(
-			reference.len(),
-			PICTURES * picture_len,
-			"ffmpeg decoded a different count"
-		);
+	/// A second H.265 sequence at another size decodes at that size, and the
+	/// first sequence's tail comes out ahead of it.
+	#[test]
+	fn a_new_h265_sequence_decodes_at_its_own_size() {
+		const PER_SEQUENCE: usize = 6;
+		let sizes = [(320u32, 240u32), (192u32, 144u32)];
 
-		let Ok(mut decoder) = Decoder::new(Config::new()) else {
-			eprintln!("skipping: no VA-API H.264 decoder");
+		let mut stream = Vec::new();
+		for &size in &sizes {
+			let Some(sequence) = software_encode(Codec::H265, size, PER_SEQUENCE, true) else {
+				eprintln!("skipping: no ffmpeg that encodes H.265");
+				return;
+			};
+			stream.extend(sequence);
+		}
+		let Ok(mut decoder) = Decoder::new(Config {
+			codec: Codec::H265,
+			..Config::new()
+		}) else {
+			eprintln!("skipping: no VA-API H.265 decoder");
 			return;
 		};
 
-		let units = split_access_units(&stream);
 		let mut decoded = Vec::new();
+		let units = split_access_units(Codec::H265, &stream);
 		for (index, unit) in units.iter().enumerate() {
 			decoded.extend(decoder.decode(unit, index as u64).expect("decode an access unit"));
 		}
 		decoded.extend(decoder.flush().expect("flush the decoder"));
-		assert_eq!(decoded.len(), PICTURES, "the decoder lost or invented pictures");
 
-		let mut timestamps: Vec<u64> = decoded.iter().map(|picture| picture.timestamp).collect();
-		assert!(
-			timestamps.windows(2).any(|pair| pair[0] > pair[1]),
-			"the stream came out in decode order, so nothing here tests reordering"
-		);
-		timestamps.sort_unstable();
-		assert_eq!(
-			timestamps,
-			(0..PICTURES as u64).collect::<Vec<_>>(),
-			"a picture's timestamp did not survive reordering"
-		);
+		let expected: Vec<(u32, u32)> = sizes
+			.iter()
+			.flat_map(|&size| std::iter::repeat_n(size, PER_SEQUENCE))
+			.collect();
+		let actual: Vec<(u32, u32)> = decoded.iter().map(|picture| (picture.width, picture.height)).collect();
+		assert_eq!(actual, expected, "a picture came out at the wrong size or out of order");
 
-		for (index, picture) in decoded.iter().enumerate() {
-			assert_eq!((picture.width, picture.height), (WIDTH, HEIGHT));
-			assert!(
-				picture.data == reference[index * picture_len..][..picture_len],
-				"picture {index} of {PICTURES} differs from the software decoder"
+		for picture in &decoded {
+			let expected_len = (picture.width * picture.height * 3 / 2) as usize;
+			assert_eq!(
+				picture.data.len(),
+				expected_len,
+				"a picture was read back at the wrong size"
 			);
 		}
 	}
@@ -2209,11 +2364,84 @@ mod tests {
 		Some(output.stdout)
 	}
 
+	/// Encodes `pictures` of ffmpeg's test pattern at `size`, with two B-frames
+	/// and three reference frames when `reorder` is set and neither otherwise,
+	/// returning the Annex-B stream. `None` without ffmpeg or its encoder.
+	fn software_encode(codec: Codec, (width, height): (u32, u32), pictures: usize, reorder: bool) -> Option<Vec<u8>> {
+		let source = format!("testsrc2=size={width}x{height}:rate=30");
+		let pictures = pictures.to_string();
+		let mut args = vec![
+			"-f",
+			"lavfi",
+			"-i",
+			&source,
+			"-frames:v",
+			&pictures,
+			"-pix_fmt",
+			"yuv420p",
+		];
+
+		let x265;
+		match codec {
+			Codec::H264 => args.extend([
+				"-c:v",
+				"libx264",
+				"-profile:v",
+				"main",
+				"-bf",
+				if reorder { "2" } else { "0" },
+				"-refs",
+				if reorder { "3" } else { "1" },
+				"-g",
+				"15",
+				"-f",
+				"h264",
+			]),
+			Codec::H265 => {
+				// x265's defaults are open GOPs, so the second keyframe is a CRA
+				// picture with leading pictures that refer across it.
+				x265 = if reorder {
+					"bframes=2:ref=3:keyint=15:min-keyint=15:log-level=error"
+				} else {
+					"bframes=0:ref=1:keyint=15:min-keyint=15:log-level=error"
+				};
+				args.extend(["-c:v", "libx265", "-x265-params", x265, "-f", "hevc"]);
+			}
+		}
+		args.push("-");
+		ffmpeg(&args)
+	}
+
+	/// Decodes `stream` with ffmpeg into packed NV12, one picture after another.
+	fn software_decode(codec: Codec, stream: &[u8]) -> Vec<u8> {
+		// ffmpeg reads the elementary stream from a file rather than a pipe, so
+		// the test never has to drain its output while still writing its input.
+		static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+		let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let extension = match codec {
+			Codec::H264 => "264",
+			Codec::H265 => "265",
+		};
+		let path = std::env::temp_dir().join(format!("moq-vaapi-decode-{}-{count}.{extension}", std::process::id()));
+		std::fs::write(&path, stream).expect("write the elementary stream");
+		let decoded = ffmpeg(&[
+			"-i",
+			path.to_str().expect("a UTF-8 temporary path"),
+			"-pix_fmt",
+			"nv12",
+			"-f",
+			"rawvideo",
+			"-",
+		]);
+		let _ = std::fs::remove_file(&path);
+		decoded.expect("ffmpeg decodes what it just encoded")
+	}
+
 	/// Splits an Annex-B elementary stream into access units.
 	///
-	/// Each picture here is a single slice, so a unit ends at the next VCL NAL
-	/// unit, or at the next parameter set or SEI that follows one.
-	fn split_access_units(stream: &[u8]) -> Vec<Vec<u8>> {
+	/// A unit ends at the first slice of the next picture, or at a parameter
+	/// set, SEI, or delimiter that comes before one.
+	fn split_access_units(codec: Codec, stream: &[u8]) -> Vec<Vec<u8>> {
 		let starts: Vec<usize> = (0..stream.len().saturating_sub(3))
 			.filter(|&i| stream[i..i + 3] == [0, 0, 1])
 			.collect();
@@ -2224,10 +2452,28 @@ mod tests {
 
 		for (index, &start) in starts.iter().enumerate() {
 			let end = starts.get(index + 1).copied().unwrap_or(stream.len());
-			let nal_type = stream[start + 3] & 0x1f;
-			let is_slice = (1..=5).contains(&nal_type);
+			let nal = &stream[start + 3..end];
+			// The first bit after the NAL header is first_mb_in_slice == 0 for
+			// H.264 and first_slice_segment_in_pic_flag for H.265: either way, set
+			// on the first slice of a picture.
+			let (is_slice, starts_picture, starts_unit) = match codec {
+				Codec::H264 => {
+					let nal_type = nal[0] & 0x1f;
+					let is_slice = (1..=5).contains(&nal_type);
+					(is_slice, is_slice && nal[1] & 0x80 != 0, matches!(nal_type, 6..=9))
+				}
+				Codec::H265 => {
+					let nal_type = (nal[0] >> 1) & 0x3f;
+					let is_slice = nal_type <= 31;
+					(
+						is_slice,
+						is_slice && nal[2] & 0x80 != 0,
+						matches!(nal_type, 32..=35 | 39),
+					)
+				}
+			};
 
-			if current_has_picture && (is_slice || matches!(nal_type, 6..=9)) {
+			if current_has_picture && (starts_picture || starts_unit) {
 				units.push(std::mem::take(&mut current));
 				current_has_picture = false;
 			}

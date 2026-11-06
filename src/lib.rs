@@ -43,6 +43,7 @@ pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_1 as VADRMPRIMESurfac
 pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_2 as VADRMPRIMESurfaceDescriptorLayer;
 pub use bindings::*;
 pub use buffer::*;
+pub use codec::Codec;
 pub use color::{Color, Matrix};
 pub use config::*;
 pub use context::*;
