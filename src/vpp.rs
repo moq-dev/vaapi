@@ -4,7 +4,8 @@
 //! processor stretches to fit the destination and converts to the destination's
 //! format on the way. That covers three jobs without the pixels leaving the GPU:
 //!
-//! - Scaling: blit into a smaller or larger surface.
+//! - Scaling: blit into a smaller or larger surface. [`Processor::resize`]
+//!   blits into NV12 surfaces it recycles per size and exports the result.
 //! - Color conversion: blit a packed RGB or YUYV surface into an NV12 one, the
 //!   format an encoder takes. [`Processor::blit`] takes the YUV space to write.
 //! - Re-tiling: blit into a surface of the same size and format. The destination
@@ -35,7 +36,9 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::decode::ExportedFrame;
 use crate::dmabuf::{rt_format, DmaBuf};
+use crate::pool::SurfacePool;
 use crate::{
 	bindings, BufferType, Color, Config as VaConfig, Context, Display, Picture, ProcColorProperties,
 	ProcPipelineParameterBuffer, Surface, SurfaceMemoryDescriptor, UsageHint, VAConfigAttrib, VAConfigAttribType,
@@ -59,12 +62,14 @@ pub fn probe(display: &Display) -> anyhow::Result<()> {
 
 /// A video post-processor on one device.
 ///
-/// Holds the display, the VPP configuration, and one processing context per
-/// destination size, which are what cost something to build. A caller
-/// converting every frame of a stream, or of a few renditions, pays for each
-/// context once.
+/// Holds the display, the VPP configuration, and per destination size a
+/// processing context and the surfaces [`resize`](Self::resize) writes into,
+/// which are what cost something to build. A caller converting every frame of
+/// a stream, or of a few renditions, pays for each once.
 pub struct Processor {
 	display: Arc<Display>,
+	/// The NV12 surfaces [`resize`](Self::resize) writes into, recycled per size.
+	outputs: RefCell<HashMap<(u32, u32), SurfacePool>>,
 	// Drop order: the contexts before the config they were created from.
 	contexts: RefCell<HashMap<(u32, u32), Rc<Context>>>,
 	config: VaConfig,
@@ -129,6 +134,7 @@ impl Processor {
 
 		Ok(Self {
 			display,
+			outputs: RefCell::new(HashMap::new()),
 			contexts: RefCell::new(HashMap::new()),
 			config,
 		})
@@ -191,6 +197,41 @@ impl Processor {
 		result
 	}
 
+	/// Scales `input` to `width` by `height` and converts it to NV12, returning the result exported.
+	///
+	/// The output comes from a pool per size, so a stream of frames costs no
+	/// allocation per frame: once the returned frame drops, its surface is the
+	/// next one written at that size. A frame still held is never written over;
+	/// the next resize allocates another surface instead. At most one free
+	/// surface is kept per size, and any returned past that is destroyed. See
+	/// [`blit`](Self::blit) for the colors.
+	///
+	/// The frame's timestamp is zero, for the caller to set.
+	///
+	/// # Errors
+	///
+	/// Fails when the destination cannot be allocated or exported, and as
+	/// [`blit`](Self::blit) does.
+	pub fn resize<D: SurfaceMemoryDescriptor>(
+		&self,
+		input: &Surface<D>,
+		size: (u32, u32),
+		input_color: Option<Color>,
+		output_color: Option<Color>,
+	) -> anyhow::Result<ExportedFrame> {
+		let output = self
+			.outputs
+			.borrow_mut()
+			.entry(size)
+			.or_insert_with(|| {
+				let hint = UsageHint::USAGE_HINT_VPP_WRITE | UsageHint::USAGE_HINT_EXPORT;
+				SurfacePool::new(&self.display, size, hint, 1)
+			})
+			.alloc()?;
+		self.blit(input, output.get(), input_color, output_color)?;
+		ExportedFrame::export(Arc::new(output), 0, size)
+	}
+
 	/// Blits `input` into a new driver-allocated surface of `fourcc`, `width` and `height`.
 	///
 	/// The destination is hinted as post-processing output that will be
@@ -201,7 +242,7 @@ impl Processor {
 	///
 	/// Fails for a format with no render target mapping, when the destination
 	/// cannot be allocated, and as [`blit`](Self::blit) does.
-	pub fn process<D: SurfaceMemoryDescriptor>(
+	fn process<D: SurfaceMemoryDescriptor>(
 		&self,
 		input: &Surface<D>,
 		fourcc: u32,
@@ -396,21 +437,8 @@ mod tests {
 			"the blit preserves the plane count"
 		);
 	}
-	/// A surface scaled by the processor exports and reads back at its new
-	/// size, with the picture scaled rather than cropped.
-	#[test]
-	fn a_scaled_surface_reads_back_at_its_new_size() {
-		let Some(display) = Display::open() else {
-			eprintln!("skipping: no VA-API display");
-			return;
-		};
-		let Ok(processor) = Processor::with_display(display) else {
-			eprintln!("skipping: device has no video post-processing entrypoint");
-			return;
-		};
-
-		// Left half dark, right half bright, so a crop and a scale differ.
-		let (width, height) = (640u32, 480u32);
+	/// An NV12 surface whose left half has luma `left` and right half `right`, so a crop and a scale differ.
+	fn split_surface(processor: &Processor, (width, height): (u32, u32), [left, right]: [u8; 2]) -> Surface<()> {
 		let source = processor
 			.display()
 			.create_surfaces(
@@ -439,7 +467,7 @@ mod tests {
 			for y in 0..height as usize {
 				let row = va_image.offsets[0] as usize + y * va_image.pitches[0] as usize;
 				for x in 0..width as usize {
-					data[row + x] = if x < width as usize / 2 { 40 } else { 200 };
+					data[row + x] = if x < width as usize / 2 { left } else { right };
 				}
 			}
 			for y in 0..height as usize / 2 {
@@ -447,20 +475,96 @@ mod tests {
 				data[row..row + width as usize].fill(128);
 			}
 		}
+		source
+	}
 
-		let scaled = processor
-			.process(&source, VA_FOURCC_NV12, (width / 2, height / 2), None, None)
+	/// Reads `frame` back and returns the luma at the middle of its left and right halves.
+	fn halves(frame: &ExportedFrame) -> [u8; 2] {
+		let data = frame.download().expect("read the frame back").data;
+		let (w, h) = (frame.width as usize, frame.height as usize);
+		assert_eq!(data.len(), w * h * 3 / 2);
+		[data[h / 2 * w + w / 8], data[h / 2 * w + w * 7 / 8]]
+	}
+
+	/// Whether every value is within 4 of the expected one.
+	fn near(actual: [u8; 2], expected: [u8; 2]) -> bool {
+		actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) < 4)
+	}
+
+	/// The inode of an exported frame's descriptor, which names the allocation
+	/// behind it: every DMA-BUF gets its own on the anonymous dma-buf filesystem,
+	/// while each export of one surface is a new descriptor.
+	fn inode(frame: &ExportedFrame) -> u64 {
+		use std::os::unix::fs::MetadataExt as _;
+
+		let fd = frame.descriptor.objects[0]
+			.fd
+			.try_clone()
+			.expect("duplicate the descriptor");
+		std::fs::File::from(fd).metadata().expect("stat the descriptor").ino()
+	}
+
+	/// A surface scaled by the processor exports and reads back at its new
+	/// size, with the picture scaled rather than cropped.
+	#[test]
+	fn a_scaled_surface_reads_back_at_its_new_size() {
+		let Some(display) = Display::open() else {
+			eprintln!("skipping: no VA-API display");
+			return;
+		};
+		let Ok(processor) = Processor::with_display(display) else {
+			eprintln!("skipping: device has no video post-processing entrypoint");
+			return;
+		};
+
+		let source = split_surface(&processor, (640, 480), [40, 200]);
+		let exported = processor
+			.resize(&source, (320, 240), None, None)
 			.expect("scale the surface");
-		let exported = crate::decode::ExportedFrame::from_surface(scaled, 7).expect("export the scaled surface");
-		assert_eq!((exported.width, exported.height), (width / 2, height / 2));
-		assert_eq!(exported.timestamp, 7);
-		let frame = exported.download().expect("read the scaled surface back");
-		let (w, h) = ((width / 2) as usize, (height / 2) as usize);
-		assert_eq!(frame.data.len(), w * h * 3 / 2);
-		let (left, right) = (frame.data[h / 2 * w + w / 8], frame.data[h / 2 * w + w * 7 / 8]);
-		assert!(
-			left.abs_diff(40) < 4 && right.abs_diff(200) < 4,
-			"read back {left} and {right}"
+		assert_eq!((exported.width, exported.height), (320, 240));
+		assert_eq!(exported.descriptor.fourcc, VA_FOURCC_NV12);
+		let read = halves(&exported);
+		assert!(near(read, [40, 200]), "read back {read:?}");
+	}
+
+	/// A resize writes into the surface of an output that was let go, never
+	/// into one still held, and keeps at most one free surface per size.
+	#[test]
+	fn a_released_output_is_written_into_again() {
+		let Some(display) = Display::open() else {
+			eprintln!("skipping: no VA-API display");
+			return;
+		};
+		let Ok(processor) = Processor::with_display(display) else {
+			eprintln!("skipping: device has no video post-processing entrypoint");
+			return;
+		};
+		let dark_left = split_surface(&processor, (640, 480), [40, 200]);
+		let dark_right = split_surface(&processor, (640, 480), [200, 40]);
+		let size = (320, 240);
+		let resize = |source| processor.resize(source, size, None, None).expect("resize");
+
+		let first = resize(&dark_left);
+		let released = inode(&first);
+		drop(first);
+		let held = resize(&dark_left);
+		assert_eq!(inode(&held), released, "the released output was not written into again");
+
+		let other = resize(&dark_right);
+		assert_ne!(inode(&other), inode(&held), "an output still held was written over");
+		let (read, other_read) = (halves(&held), halves(&other));
+		assert!(near(read, [40, 200]), "the held output now reads {read:?}");
+		assert!(near(other_read, [200, 40]), "the second output reads {other_read:?}");
+
+		drop(held);
+		drop(other);
+		let outputs = processor.outputs.borrow();
+		let pool = &outputs[&size];
+		assert_eq!(pool.allocated.get(), 2, "two outputs held at once need two surfaces");
+		assert_eq!(
+			pool.free.surfaces.lock().unwrap().len(),
+			1,
+			"one free surface is kept per size, and the other destroyed"
 		);
 	}
 }
