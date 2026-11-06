@@ -44,10 +44,15 @@ pulled in as a git dependency.
   Meteor Lake (iHD 26.1.5) for constrained baseline, main with B-frames, high at
   720p, and a cropped non-macroblock-aligned size. The main-with-B-frames case
   runs as a test wherever ffmpeg and a VA-API device are both present.
-- **Pinned, vendored headers.** libva's headers are vendored into
-  [`libva/`](./libva) (see `just vendor`) and fed to bindgen, so generating the
-  bindings needs **no system libva-dev** — only `libclang` — and the pinned
-  version means a system libva bump can't drift the bindings.
+- **Checked-in bindings from pinned headers.** libva's headers are vendored
+  into [`libva/`](./libva) (see `just vendor`), and `just bindgen` generates
+  [`src/bindings/libva.rs`](./src/bindings/libva.rs) from them. The output is
+  checked in, so building the crate needs **no libclang, no libva-dev, and no
+  build script**, and the pinned version means a system libva bump can't drift
+  the bindings. The file is portable: fixed-width C types, no layout tests, and
+  the two VPP structs whose padding libva sizes by pointer width carry both
+  layouts under a `cfg`. `just ci` fails if the file is not what the headers
+  generate.
 - **Loads system libva at runtime on Linux.** The generated `Va` function table
   loads `libva` / `libva-drm` with `libloading`. Building needs no system libva,
   and a binary can start without it; opening a display reports a missing driver
@@ -70,7 +75,7 @@ This run checked all five cros-libva commits and the one cros-codecs commit:
 | --- | --- |
 | cros-libva [`838808ce`](https://github.com/chromeos/cros-libva/commit/838808cebfeff64f5c3543c873dbc604857b3702), protected-content headers | Not needed: no protected-content consumer or Android build in this crate. |
 | cros-libva [`89454d66`](https://github.com/chromeos/cros-libva/commit/89454d660411627a4a463116fdea00ac1ac888bc), explicit image lifetimes | Already present in `Image::create_from` and `Picture::{derive_image,create_image}`. |
-| cros-libva [`9f3c0d92`](https://github.com/chromeos/cros-libva/commit/9f3c0d9264ec04b4fa792764178b879341ce33b1), packed-header bindings | Already present in `bindgen_gen.rs`, `buffer.rs`, and the H.264 encoder. |
+| cros-libva [`9f3c0d92`](https://github.com/chromeos/cros-libva/commit/9f3c0d9264ec04b4fa792764178b879341ce33b1), packed-header bindings | Already present in the `bindgen` allowlist, `buffer.rs`, and the H.264 encoder. |
 | cros-libva [`ed9c63b7`](https://github.com/chromeos/cros-libva/commit/ed9c63b743ce9490e1079a8b0c1a24b8e879324f), borrowed input buffers | Optional copy avoidance, not a correctness fix. Keep the existing owned-buffer API; no new public API or optimization without measurement. |
 | cros-libva [`59384456`](https://github.com/chromeos/cros-libva/commit/59384456ac2ae78c0c3e5515f41ef1efd9b802cf), libva 2.23 VP9 fields | Build compatibility already covered by `..Default::default()` in the retained VP9 wrapper against pinned 2.23 headers. The codec drivers support H.264 only, so no VP9 segmentation control is needed. |
 | cros-codecs [`a050c6cd`](https://github.com/chromeos/cros-codecs/commit/a050c6cde530e563197ee9e3e72ab01f48a0c41f), release log filtering | Ported: remove `log/release_max_level_debug`, which conflicts with a consumer selecting another release level. `just ci` checks feature unification with `log/release_max_level_trace`. |
@@ -91,7 +96,8 @@ advisories checked, not a guarantee that no undisclosed vulnerabilities exist.
   and decode drivers (`encode`, `decode`), DMA-BUF import (`dmabuf`), video
   post-processing (`vpp`), and the color space both share (`color`).
 - `libva/` — vendored libva headers (checked in; refreshed by `just vendor`).
-- `build.rs` + `bindgen_gen.rs` + `libva-wrapper.h` — bindgen setup.
+- `libva-wrapper.h` + the `bindgen` recipe in `justfile` — what generates
+  `src/bindings/libva.rs`.
 
 ## Development
 
@@ -99,8 +105,9 @@ Recipes run inside the nix devShell:
 
 ```sh
 nix develop --command just check     # clippy + fmt
-nix develop --command just ci        # check + cargo-deny
-nix develop --command just vendor    # refresh libva/ headers from upstream
+nix develop --command just ci        # check + tests + bindings drift + cargo-deny
+nix develop --command just vendor    # refresh libva/ headers from upstream, then the bindings
+nix develop --command just bindgen   # regenerate src/bindings/libva.rs
 ```
 
 The crate compiles on macOS for development, with no link-time dependency on
