@@ -1,5 +1,5 @@
 {
-  description = "moq-vaapi - VA-API H.264 encoder (vendored libva)";
+  description = "moq-vaapi - VA-API hardware video codecs (vendored libva)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -44,19 +44,14 @@
               just
               git
               cargo-deny
-              # bindgen needs libclang to parse the vendored libva headers.
-              clang
+              # `just bindgen` regenerates the checked-in bindings; builds need neither it nor libclang.
+              rust-bindgen
             ]
             ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
               # libva is dlopen'd at runtime (not linked at build), so this is only
               # needed to actually run vaapi encode in the devShell. macOS has no VAAPI.
               libva
             ];
-
-          # bindgen locates libclang via this.
-          shellHook = ''
-            export LIBCLANG_PATH="${pkgs.libclang.lib}/lib"
-          '';
         };
 
         formatter = pkgs.nixfmt-tree;

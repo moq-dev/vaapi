@@ -97,7 +97,6 @@ where
 pub enum DecodeErrorType {
 	SliceMissing = bindings::VADecodeErrorType::VADecodeSliceMissing,
 	MBError = bindings::VADecodeErrorType::VADecodeMBError,
-	#[cfg(libva_1_20_or_higher)]
 	Reset = bindings::VADecodeErrorType::VADecodeReset,
 }
 
@@ -302,7 +301,6 @@ impl<D: SurfaceMemoryDescriptor> Surface<D> {
 			let type_ = match error.decode_error_type {
 				bindings::VADecodeErrorType::VADecodeSliceMissing => DecodeErrorType::SliceMissing,
 				bindings::VADecodeErrorType::VADecodeMBError => DecodeErrorType::MBError,
-				#[cfg(libva_1_20_or_higher)]
 				bindings::VADecodeErrorType::VADecodeReset => DecodeErrorType::Reset,
 				_ => {
 					log::warn!("Unrecognized `decode_error_type` value ({})", error.decode_error_type);

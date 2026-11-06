@@ -9,7 +9,7 @@
 
 // Most of this crate is derived from discord/cros-libva + discord/cros-codecs
 // (BSD-3-Clause). Don't subject upstream code to this workspace's strict lints;
-// the build script also emits custom `libva_*_or_higher` cfgs.
+// the vendored synthesizer also keeps cros-codecs's `feature = "vaapi"` gates.
 #![allow(dead_code, unused_imports, unexpected_cfgs, mismatched_lifetime_syntaxes)]
 #![allow(clippy::all)]
 

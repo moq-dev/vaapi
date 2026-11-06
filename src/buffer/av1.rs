@@ -600,13 +600,9 @@ impl AV1EncSeqFields {
 			enable_superres,
 			enable_cdef,
 			enable_restoration,
-			#[cfg(libva_1_15_or_higher)]
 			bit_depth_minus8,
-			#[cfg(libva_1_15_or_higher)]
 			subsampling_x,
-			#[cfg(libva_1_15_or_higher)]
 			subsampling_y,
-			#[cfg(libva_1_19_or_higher)]
 			mono_chrome,
 			Default::default(),
 		);
@@ -641,7 +637,6 @@ impl EncSequenceParameterBufferAV1 {
 			seq_profile,
 			seq_level_idx,
 			seq_tier,
-			#[cfg(libva_1_16_or_higher)]
 			hierarchical_flag,
 			intra_period,
 			ip_period,
@@ -723,9 +718,7 @@ impl AV1EncPictureFlags {
 		let disable_frame_recon = disable_frame_recon as u32;
 		let allow_intrabc = allow_intrabc as u32;
 		let palette_mode_enable = palette_mode_enable as u32;
-		#[cfg(libva_1_21_or_higher)]
 		let allow_screen_content_tools = allow_screen_content_tools as u32;
-		#[cfg(libva_1_21_or_higher)]
 		let force_integer_mv = force_integer_mv as u32;
 
 		let _bitfield_1 = {
@@ -743,9 +736,7 @@ impl AV1EncPictureFlags {
 				disable_frame_recon,
 				allow_intrabc,
 				palette_mode_enable,
-				#[cfg(libva_1_21_or_higher)]
 				allow_screen_content_tools,
-				#[cfg(libva_1_21_or_higher)]
 				force_integer_mv,
 				Default::default(),
 			)
@@ -1042,11 +1033,9 @@ impl EncPictureParameterBufferAV1 {
 			coded_buf,
 			reference_frames,
 			ref_frame_idx,
-			#[cfg(libva_1_19_or_higher)]
 			hierarchical_level_plus1,
 			primary_ref_frame,
 			order_hint,
-			#[cfg(libva_1_15_or_higher)]
 			refresh_frame_flags,
 			ref_frame_ctrl_l0,
 			ref_frame_ctrl_l1,
