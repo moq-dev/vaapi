@@ -10,14 +10,12 @@ use crate::codec::h264::parser::HrdParams;
 use crate::codec::h264::parser::NaluType;
 use crate::codec::h264::parser::Pps;
 use crate::codec::h264::parser::SliceHeader;
-#[cfg(feature = "vaapi")]
 use crate::codec::h264::parser::SliceType;
 use crate::codec::h264::parser::Sps;
 use crate::codec::h264::parser::DEFAULT_4X4_INTER;
 use crate::codec::h264::parser::DEFAULT_4X4_INTRA;
 use crate::codec::h264::parser::DEFAULT_8X8_INTER;
 use crate::codec::h264::parser::DEFAULT_8X8_INTRA;
-#[cfg(feature = "vaapi")]
 use crate::encode::IsReference;
 
 mod private {
@@ -435,10 +433,8 @@ impl<'n, W: Write> Synthesizer<'n, Pps, W> {
 	}
 }
 
-#[cfg(feature = "vaapi")]
 pub type NumTrailingBits = u8;
 
-#[cfg(feature = "vaapi")]
 impl<'n, W: Write> Synthesizer<'n, SliceHeader, W> {
 	pub fn synthesize(
 		header: &'n SliceHeader,

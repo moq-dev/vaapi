@@ -250,11 +250,11 @@ impl Stream {
 			self.slice_parameters(slice_type, reference.as_ref()),
 		];
 		if picture.idr && packed & VA_ENC_PACKED_HEADER_SEQUENCE != 0 {
-			buffers.extend(packed_header(EncPackedHeaderType::Sequence, &self.headers));
+			buffers.extend(super::packed_header(EncPackedHeaderType::Sequence, &self.headers, self.headers.len() * 8));
 		}
 		if packed & VA_ENC_PACKED_HEADER_SLICE != 0 {
 			let header = self.slice_header(nal_type, slice_type, picture.count);
-			buffers.extend(packed_header(EncPackedHeaderType::Slice, &header));
+			buffers.extend(super::packed_header(EncPackedHeaderType::Slice, &header, header.len() * 8));
 		}
 		buffers
 	}
@@ -680,12 +680,6 @@ fn timing(w: &mut Rbsp, framerate: u32) {
 	w.bits(32, framerate.max(1)); // time_scale
 	w.flag(true); // poc_proportional_to_timing_flag
 	w.ue(0); // num_ticks_poc_diff_one_minus1
-}
-
-/// Returns the packed-header parameter and data buffers for `data`, which carries its own emulation prevention.
-fn packed_header(kind: EncPackedHeaderType, data: &[u8]) -> [BufferType; 2] {
-	let (param, payload) = super::packed_header(kind, data);
-	[param, payload]
 }
 
 /// Returns `general_level_idc` for the lowest Main tier level whose picture size and sample rate cover a `coded` picture at `framerate`.

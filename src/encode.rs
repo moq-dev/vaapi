@@ -156,6 +156,8 @@ struct Reference {
 /// What one picture's parameter buffers are built from.
 struct PictureInfo<'a> {
 	idr: bool,
+	/// How many IDR pictures came before this one.
+	idr_id: u32,
 	/// How many pictures after the IDR this one comes.
 	count: u32,
 	/// The surface its reconstruction is written to.
@@ -170,6 +172,8 @@ enum Syntax {
 	H264 {
 		sps: Rc<Sps>,
 		pps: Rc<Pps>,
+		/// The packed header kinds the driver takes from us; it writes the rest.
+		packed: u32,
 	},
 	H265 {
 		stream: h265::Stream,
@@ -191,6 +195,8 @@ pub struct Encoder {
 	reference: Option<(usize, u32)>,
 
 	counter: u32,
+	/// IDR pictures coded so far, so two in a row carry different H.264 `idr_pic_id`s.
+	idrs: u32,
 
 	/// The video processor converting and scaling DMA-BUF input, opened on the
 	/// first frame that needs it.
@@ -244,10 +250,12 @@ impl Encoder {
 		// buffering) and the level are ours. For H.264 that is the SPS and PPS;
 		// iHD takes them without being told, and a driver that follows the spec
 		// writes its own unless the config asks. For H.265 it is the VPS, SPS and
-		// PPS as one sequence header, plus each slice header, as ffmpeg packs
-		// them; the driver writes the slice headers if it does not take them.
+		// PPS as one sequence header. Each slice header is packed too, as ffmpeg
+		// packs them; the driver writes the slice headers if it does not take
+		// them. radeonsi needs them for H.264: it takes the slice's NAL header
+		// from the packed one, and drops the packed parameter sets without one.
 		let wanted = match codec {
-			Codec::H264 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE,
+			Codec::H264 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE | VA_ENC_PACKED_HEADER_SLICE,
 			Codec::H265 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_SLICE,
 		};
 		let packed = packed_headers(&display, codec, entrypoint) & wanted;
@@ -271,7 +279,7 @@ impl Encoder {
 		let syntax = match codec {
 			Codec::H264 => {
 				let (sps, pps) = build_sps_pps(&config);
-				Syntax::H264 { sps, pps }
+				Syntax::H264 { sps, pps, packed }
 			}
 			Codec::H265 => Syntax::H265 {
 				stream: h265::Stream::new(&display, entrypoint, &mut va_config, &config)?,
@@ -315,6 +323,7 @@ impl Encoder {
 			recon,
 			reference: None,
 			counter: 0,
+			idrs: 0,
 			processor: None,
 			reset_rate_control: false,
 			coded,
@@ -477,6 +486,7 @@ impl Encoder {
 		};
 		let info = PictureInfo {
 			idr: is_idr,
+			idr_id: self.idrs,
 			count: self.counter,
 			recon: self.recon[recon_idx].id(),
 			reference,
@@ -484,13 +494,7 @@ impl Encoder {
 			bitrate: self.config.bitrate,
 		};
 		let buffers = match &self.syntax {
-			Syntax::H264 { sps, pps } => {
-				let mut buffers = h264_buffers(sps, pps, &info);
-				if is_idr {
-					buffers.extend(packed_parameter_sets(sps, pps)?);
-				}
-				buffers
-			}
+			Syntax::H264 { sps, pps, packed } => h264_buffers(sps, pps, &info, *packed)?,
 			Syntax::H265 { stream, packed } => stream.buffers(&self.config, &info, *packed),
 		};
 
@@ -537,6 +541,7 @@ impl Encoder {
 
 		self.reference = Some((recon_idx, self.counter));
 		self.counter += 1;
+		self.idrs = self.idrs.wrapping_add(u32::from(is_idr));
 		self.reset_rate_control = false;
 		Ok(bitstream)
 	}
@@ -751,8 +756,8 @@ fn build_sps_pps(config: &Config) -> (Rc<Sps>, Rc<Pps>) {
 	(sps, pps)
 }
 
-/// Returns the sequence, picture and slice parameters of one H.264 picture.
-fn h264_buffers(sps: &Sps, pps: &Rc<Pps>, picture: &PictureInfo<'_>) -> Vec<BufferType> {
+/// Returns the parameter buffers of one H.264 picture, then the packed headers the driver takes: the SPS and PPS on an IDR, and the slice header.
+fn h264_buffers(sps: &Sps, pps: &Rc<Pps>, picture: &PictureInfo<'_>, packed: u32) -> anyhow::Result<Vec<BufferType>> {
 	let meta = FrameMeta::new(picture.count);
 	let slice_type = if picture.idr { SliceType::I } else { SliceType::P };
 	let header = SliceHeaderBuilder::new(pps)
@@ -760,17 +765,39 @@ fn h264_buffers(sps: &Sps, pps: &Rc<Pps>, picture: &PictureInfo<'_>) -> Vec<Buff
 		.first_mb_in_slice(0)
 		.frame_num(meta.frame_num as u16)
 		.pic_order_cnt_lsb((meta.poc % (LIMIT * 2)) as u16)
+		// Only consecutive IDRs must differ.
+		.idr_pic_id((picture.idr_id % 2) as u16)
 		.build();
 	let macroblocks = (sps.pic_width_in_mbs_minus1 as u32 + 1) * (sps.pic_height_in_map_units_minus1 as u32 + 1);
 	let reference = picture
 		.reference
 		.map(|reference| (reference.surface, FrameMeta::new(reference.count)));
 
-	vec![
+	let mut buffers = vec![
 		build_enc_seq_param(sps, picture.bitrate, LIMIT, 0),
 		build_enc_pic_param(pps, picture.coded, picture.recon, meta, picture.idr, reference),
 		build_enc_slice_param(pps, &header, reference, macroblocks),
-	]
+	];
+	if picture.idr && packed & VA_ENC_PACKED_HEADER_SEQUENCE != 0 {
+		buffers.extend(packed_parameter_sets(sps, pps)?);
+	}
+	if packed & VA_ENC_PACKED_HEADER_SLICE != 0 {
+		let mut nal = Vec::new();
+		let trailing = Synthesizer::<'_, SliceHeader, _>::synthesize(
+			&header,
+			sps,
+			pps,
+			picture.idr,
+			IsReference::ShortTerm,
+			&mut nal,
+			true,
+		)
+		.map_err(|e| anyhow::anyhow!("synthesize slice header: {e:?}"))?;
+		// The slice data follows the header's last bit, not its padded last byte.
+		let bits = nal.len() * 8 - usize::from(trailing);
+		buffers.extend(packed_header(EncPackedHeaderType::Slice, &nal, bits));
+	}
+	Ok(buffers)
 }
 
 /// Returns the SPS and PPS as packed headers, which go out with every IDR.
@@ -782,8 +809,8 @@ fn packed_parameter_sets(sps: &Sps, pps: &Pps) -> anyhow::Result<[BufferType; 4]
 	Synthesizer::<'_, Pps, _>::synthesize(3, pps, &mut pps_nal, true)
 		.map_err(|e| anyhow::anyhow!("synthesize PPS: {e:?}"))?;
 
-	let (sps_param, sps_data) = packed_header(EncPackedHeaderType::Sequence, &sps_nal);
-	let (pps_param, pps_data) = packed_header(EncPackedHeaderType::Picture, &pps_nal);
+	let [sps_param, sps_data] = packed_header(EncPackedHeaderType::Sequence, &sps_nal, sps_nal.len() * 8);
+	let [pps_param, pps_data] = packed_header(EncPackedHeaderType::Picture, &pps_nal, pps_nal.len() * 8);
 	Ok([sps_param, sps_data, pps_param, pps_data])
 }
 
@@ -978,12 +1005,11 @@ fn build_enc_slice_param(
 	)))
 }
 
-/// A packed-header parameter + data buffer pair for a synthesized NAL.
-fn packed_header(kind: EncPackedHeaderType, data: &[u8]) -> (BufferType, BufferType) {
-	let param =
-		BufferType::EncPackedHeaderParameter(EncPackedHeaderParameter::new(kind, (data.len() * 8) as u32, true));
+/// Returns the packed-header parameter and data buffers for the first `bits` of `data`, a NAL unit that carries its own emulation prevention.
+fn packed_header(kind: EncPackedHeaderType, data: &[u8], bits: usize) -> [BufferType; 2] {
+	let param = BufferType::EncPackedHeaderParameter(EncPackedHeaderParameter::new(kind, bits as u32, true));
 	let payload = BufferType::EncPackedHeaderData(data.to_vec());
-	(param, payload)
+	[param, payload]
 }
 
 #[cfg(test)]
