@@ -48,7 +48,7 @@ use crate::{
 /// ITU-T H.273 code points for an explicitly described side of a blit.
 const PRIMARIES_BT709: u8 = 1;
 const TRANSFER_BT709: u8 = 1;
-const MATRIX_RGB: u8 = 0;
+const MATRIX_UNSPECIFIED: u8 = 2;
 
 /// Checks that `display`'s driver offers video post-processing, which is what [`Processor::with_display`] needs of a render node.
 ///
@@ -360,8 +360,7 @@ enum Colors {
 /// No regions (so the whole input stretched over the whole output), no
 /// filters, no references, no rotation or mirroring, and each side's color
 /// space and range as given, in the form `colors` names. A side left `None` is
-/// the driver's default, or RGB under [`Colors::Explicit`] when the other side
-/// is named.
+/// the driver's default for its format.
 fn pipeline(
 	surface: bindings::VASurfaceID,
 	colors: Colors,
@@ -371,7 +370,7 @@ fn pipeline(
 	let named = input_color.is_some() || output_color.is_some();
 	let side = |color: Option<Color>| match (colors, color) {
 		(Colors::Explicit, _) if named => {
-			let (range, matrix) = color.map_or((0, MATRIX_RGB), |color| (color.va_range(), color.vui().2));
+			let (range, matrix) = color.map_or((0, MATRIX_UNSPECIFIED), |color| (color.va_range(), color.vui().2));
 			(
 				bindings::_VAProcColorStandardType_VAProcColorStandardExplicit as u8,
 				ProcColorProperties::new(0, range, PRIMARIES_BT709, TRANSFER_BT709, matrix),
