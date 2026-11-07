@@ -45,6 +45,11 @@ use crate::{
 	VAEntrypoint, VAProfile,
 };
 
+/// ITU-T H.273 code points for an explicitly described side of a blit.
+const PRIMARIES_BT709: u8 = 1;
+const TRANSFER_BT709: u8 = 1;
+const MATRIX_UNSPECIFIED: u8 = 2;
+
 /// Checks that `display`'s driver offers video post-processing, which is what [`Processor::with_display`] needs of a render node.
 ///
 /// # Errors
@@ -68,6 +73,8 @@ pub fn probe(display: &Display) -> anyhow::Result<()> {
 /// a stream, or of a few renditions, pays for each once.
 pub struct Processor {
 	display: Arc<Display>,
+	/// How the driver reads a named color space; see [`Colors`].
+	colors: Colors,
 	/// The NV12 surfaces [`resize`](Self::resize) writes into, recycled per size.
 	outputs: RefCell<HashMap<(u32, u32), SurfacePool>>,
 	// Drop order: the contexts before the config they were created from.
@@ -132,8 +139,14 @@ impl Processor {
 			)
 			.map_err(|e| anyhow::anyhow!("create VPP config: {e:?}"))?;
 
+		// Mesa's VA frontend serves every Gallium driver, radeonsi included.
+		let colors = match display.query_vendor_string() {
+			Ok(vendor) if vendor.starts_with("Mesa Gallium driver") => Colors::Explicit,
+			_ => Colors::Standard,
+		};
 		Ok(Self {
 			display,
+			colors,
 			outputs: RefCell::new(HashMap::new()),
 			contexts: RefCell::new(HashMap::new()),
 			config,
@@ -188,7 +201,8 @@ impl Processor {
 		}
 		let size = output.size();
 		let context = self.context(size)?;
-		let result = run_blit(&context, input, output, input_color, output_color);
+		let parameters = pipeline(input.id(), self.colors, input_color, output_color);
+		let result = run_blit(&context, output, parameters);
 		if result.is_err() {
 			// A picture that failed half way can leave the context mid-picture,
 			// so the next blit of this size starts on a fresh one.
@@ -303,18 +317,11 @@ impl Processor {
 }
 
 /// Runs one blit on `context` and waits for it to finish.
-fn run_blit<D, E>(
+fn run_blit<E: SurfaceMemoryDescriptor>(
 	context: &Rc<Context>,
-	input: &Surface<D>,
 	output: &Surface<E>,
-	input_color: Option<Color>,
-	output_color: Option<Color>,
-) -> anyhow::Result<()>
-where
-	D: SurfaceMemoryDescriptor,
-	E: SurfaceMemoryDescriptor,
-{
-	let parameters = pipeline(input.id(), input_color, output_color);
+	parameters: ProcPipelineParameterBuffer,
+) -> anyhow::Result<()> {
 	let buffer = context
 		.create_buffer(BufferType::ProcPipelineParameter(parameters))
 		.map_err(|e| anyhow::anyhow!("create VPP pipeline buffer: {e:?}"))?;
@@ -333,22 +340,47 @@ where
 	Ok(())
 }
 
+/// How a driver's video processor reads a named color space.
+///
+/// A [`Color`] is a matrix and a range and nothing more, as every other
+/// conversion in the stack is, so a blit has to change those two alone. A
+/// named standard asks iHD for exactly that. Mesa takes the BT.601 standard to
+/// mean SMPTE 170M primaries and transfer as well, and gamut-maps red and green
+/// by up to 10 code values, so it is given each side explicitly with the same
+/// primaries and transfer on both. iHD reads an explicit side by its primaries
+/// alone, which is why the two cannot share one form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Colors {
+	Standard,
+	Explicit,
+}
+
 /// Returns a pipeline parameter buffer describing a plain blit of `surface`.
 ///
 /// No regions (so the whole input stretched over the whole output), no
 /// filters, no references, no rotation or mirroring, and each side's color
-/// standard and range as given, or the driver's default where not.
+/// space and range as given, in the form `colors` names. A side left `None` is
+/// the driver's default for its format.
 fn pipeline(
 	surface: bindings::VASurfaceID,
+	colors: Colors,
 	input_color: Option<Color>,
 	output_color: Option<Color>,
 ) -> ProcPipelineParameterBuffer {
-	let side = |color: Option<Color>| match color {
-		Some(color) => (
+	let named = input_color.is_some() || output_color.is_some();
+	let side = |color: Option<Color>| match (colors, color) {
+		(Colors::Explicit, _) if named => {
+			let (range, matrix) = color.map_or((0, MATRIX_UNSPECIFIED), |color| (color.va_range(), color.vui().2));
+			(
+				bindings::_VAProcColorStandardType_VAProcColorStandardExplicit as u8,
+				ProcColorProperties::new(0, range, PRIMARIES_BT709, TRANSFER_BT709, matrix),
+			)
+		}
+		(_, Some(color)) => (
 			color.va_standard(),
 			ProcColorProperties::new(0, color.va_range(), 0, 0, 0),
 		),
-		None => (0, ProcColorProperties::default()),
+		(_, None) => (0, ProcColorProperties::default()),
 	};
 	let (input_standard, input_properties) = side(input_color);
 	let (output_standard, output_properties) = side(output_color);

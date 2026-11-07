@@ -27,11 +27,12 @@
 //!   the GPU.
 //! - [`Encoder::encode_nv12`] uploads CPU pixels.
 //!
-//! Checked on Intel Meteor Lake with the iHD driver by decoding with ffmpeg's
-//! software decoder: CPU and DMA-BUF input come back above 35 dB luma PSNR,
-//! and BGRX converts to BT.601 and BT.709 with every channel within 6 code
-//! values of the reference. The low-power entrypoint is untested, since that
-//! device exposes the full one.
+//! Checked on Intel Meteor Lake and Arrow Lake with the iHD driver, and on an
+//! AMD RX 9070 with radeonsi, by decoding with ffmpeg's software decoder: CPU
+//! and DMA-BUF input come back above 35 dB luma PSNR, and BGRX converts to
+//! BT.601 and BT.709 with every channel within 6 code values of the reference.
+//! The low-power entrypoint is untested, since those devices expose the full
+//! one.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -66,14 +67,15 @@ pub enum IsReference {
 	LongTerm,
 }
 
-/// Quantizer bounds carried over from the cros-codecs encoder.
+/// Quantizer bounds for the rate controller.
 ///
-/// The full H.264 range lets Intel's CBR controller spend too much of a GOP on
-/// its IDR and then raise the P-frame quantizer enough to produce a visible
-/// quality pulse. These bounds trade strict CBR at the extremes for stable
-/// picture quality.
+/// The floor keeps an IDR on easy content from taking a large share of the
+/// rate. The ceiling is the codecs' own: iHD and radeonsi both honor it, so a
+/// lower one sets a smallest picture, and a stream asked for less overshoots
+/// its rate several times over. A lower ceiling does steady iHD's H.264 IDRs,
+/// but under congestion missing the rate costs more than that.
 const MIN_QP: u8 = 18;
-const MAX_QP: u8 = 36;
+const MAX_QP: u8 = 51;
 /// Window over which libva's rate controller targets the configured bitrate.
 ///
 /// This matches cros-codecs. The old `framerate * 1000` value confused frames
@@ -156,6 +158,8 @@ struct Reference {
 /// What one picture's parameter buffers are built from.
 struct PictureInfo<'a> {
 	idr: bool,
+	/// How many IDR pictures came before this one.
+	idr_id: u32,
 	/// How many pictures after the IDR this one comes.
 	count: u32,
 	/// The surface its reconstruction is written to.
@@ -170,6 +174,8 @@ enum Syntax {
 	H264 {
 		sps: Rc<Sps>,
 		pps: Rc<Pps>,
+		/// The packed header kinds the driver takes from us; it writes the rest.
+		packed: u32,
 	},
 	H265 {
 		stream: h265::Stream,
@@ -191,6 +197,8 @@ pub struct Encoder {
 	reference: Option<(usize, u32)>,
 
 	counter: u32,
+	/// IDR pictures coded so far, so two in a row carry different H.264 `idr_pic_id`s.
+	idrs: u32,
 
 	/// The video processor converting and scaling DMA-BUF input, opened on the
 	/// first frame that needs it.
@@ -244,10 +252,12 @@ impl Encoder {
 		// buffering) and the level are ours. For H.264 that is the SPS and PPS;
 		// iHD takes them without being told, and a driver that follows the spec
 		// writes its own unless the config asks. For H.265 it is the VPS, SPS and
-		// PPS as one sequence header, plus each slice header, as ffmpeg packs
-		// them; the driver writes the slice headers if it does not take them.
+		// PPS as one sequence header. Each slice header is packed too, as ffmpeg
+		// packs them; the driver writes the slice headers if it does not take
+		// them. radeonsi needs them for H.264: it takes the slice's NAL header
+		// from the packed one, and drops the packed parameter sets without one.
 		let wanted = match codec {
-			Codec::H264 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE,
+			Codec::H264 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE | VA_ENC_PACKED_HEADER_SLICE,
 			Codec::H265 => VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_SLICE,
 		};
 		let packed = packed_headers(&display, codec, entrypoint) & wanted;
@@ -271,7 +281,7 @@ impl Encoder {
 		let syntax = match codec {
 			Codec::H264 => {
 				let (sps, pps) = build_sps_pps(&config);
-				Syntax::H264 { sps, pps }
+				Syntax::H264 { sps, pps, packed }
 			}
 			Codec::H265 => Syntax::H265 {
 				stream: h265::Stream::new(&display, entrypoint, &mut va_config, &config)?,
@@ -315,6 +325,7 @@ impl Encoder {
 			recon,
 			reference: None,
 			counter: 0,
+			idrs: 0,
 			processor: None,
 			reset_rate_control: false,
 			coded,
@@ -477,6 +488,7 @@ impl Encoder {
 		};
 		let info = PictureInfo {
 			idr: is_idr,
+			idr_id: self.idrs,
 			count: self.counter,
 			recon: self.recon[recon_idx].id(),
 			reference,
@@ -484,13 +496,7 @@ impl Encoder {
 			bitrate: self.config.bitrate,
 		};
 		let buffers = match &self.syntax {
-			Syntax::H264 { sps, pps } => {
-				let mut buffers = h264_buffers(sps, pps, &info);
-				if is_idr {
-					buffers.extend(packed_parameter_sets(sps, pps)?);
-				}
-				buffers
-			}
+			Syntax::H264 { sps, pps, packed } => h264_buffers(sps, pps, &info, *packed)?,
 			Syntax::H265 { stream, packed } => stream.buffers(&self.config, &info, *packed),
 		};
 
@@ -537,6 +543,7 @@ impl Encoder {
 
 		self.reference = Some((recon_idx, self.counter));
 		self.counter += 1;
+		self.idrs = self.idrs.wrapping_add(u32::from(is_idr));
 		self.reset_rate_control = false;
 		Ok(bitstream)
 	}
@@ -751,8 +758,8 @@ fn build_sps_pps(config: &Config) -> (Rc<Sps>, Rc<Pps>) {
 	(sps, pps)
 }
 
-/// Returns the sequence, picture and slice parameters of one H.264 picture.
-fn h264_buffers(sps: &Sps, pps: &Rc<Pps>, picture: &PictureInfo<'_>) -> Vec<BufferType> {
+/// Returns the parameter buffers of one H.264 picture, then the packed headers the driver takes: the SPS and PPS on an IDR, and the slice header.
+fn h264_buffers(sps: &Sps, pps: &Rc<Pps>, picture: &PictureInfo<'_>, packed: u32) -> anyhow::Result<Vec<BufferType>> {
 	let meta = FrameMeta::new(picture.count);
 	let slice_type = if picture.idr { SliceType::I } else { SliceType::P };
 	let header = SliceHeaderBuilder::new(pps)
@@ -760,17 +767,39 @@ fn h264_buffers(sps: &Sps, pps: &Rc<Pps>, picture: &PictureInfo<'_>) -> Vec<Buff
 		.first_mb_in_slice(0)
 		.frame_num(meta.frame_num as u16)
 		.pic_order_cnt_lsb((meta.poc % (LIMIT * 2)) as u16)
+		// Only consecutive IDRs must differ.
+		.idr_pic_id((picture.idr_id % 2) as u16)
 		.build();
 	let macroblocks = (sps.pic_width_in_mbs_minus1 as u32 + 1) * (sps.pic_height_in_map_units_minus1 as u32 + 1);
 	let reference = picture
 		.reference
 		.map(|reference| (reference.surface, FrameMeta::new(reference.count)));
 
-	vec![
+	let mut buffers = vec![
 		build_enc_seq_param(sps, picture.bitrate, LIMIT, 0),
 		build_enc_pic_param(pps, picture.coded, picture.recon, meta, picture.idr, reference),
 		build_enc_slice_param(pps, &header, reference, macroblocks),
-	]
+	];
+	if picture.idr && packed & VA_ENC_PACKED_HEADER_SEQUENCE != 0 {
+		buffers.extend(packed_parameter_sets(sps, pps)?);
+	}
+	if packed & VA_ENC_PACKED_HEADER_SLICE != 0 {
+		let mut nal = Vec::new();
+		let trailing = Synthesizer::<'_, SliceHeader, _>::synthesize(
+			&header,
+			sps,
+			pps,
+			picture.idr,
+			IsReference::ShortTerm,
+			&mut nal,
+			true,
+		)
+		.map_err(|e| anyhow::anyhow!("synthesize slice header: {e:?}"))?;
+		// The slice data follows the header's last bit, not its padded last byte.
+		let bits = nal.len() * 8 - usize::from(trailing);
+		buffers.extend(packed_header(EncPackedHeaderType::Slice, &nal, bits));
+	}
+	Ok(buffers)
 }
 
 /// Returns the SPS and PPS as packed headers, which go out with every IDR.
@@ -782,8 +811,8 @@ fn packed_parameter_sets(sps: &Sps, pps: &Pps) -> anyhow::Result<[BufferType; 4]
 	Synthesizer::<'_, Pps, _>::synthesize(3, pps, &mut pps_nal, true)
 		.map_err(|e| anyhow::anyhow!("synthesize PPS: {e:?}"))?;
 
-	let (sps_param, sps_data) = packed_header(EncPackedHeaderType::Sequence, &sps_nal);
-	let (pps_param, pps_data) = packed_header(EncPackedHeaderType::Picture, &pps_nal);
+	let [sps_param, sps_data] = packed_header(EncPackedHeaderType::Sequence, &sps_nal, sps_nal.len() * 8);
+	let [pps_param, pps_data] = packed_header(EncPackedHeaderType::Picture, &pps_nal, pps_nal.len() * 8);
 	Ok([sps_param, sps_data, pps_param, pps_data])
 }
 
@@ -978,12 +1007,11 @@ fn build_enc_slice_param(
 	)))
 }
 
-/// A packed-header parameter + data buffer pair for a synthesized NAL.
-fn packed_header(kind: EncPackedHeaderType, data: &[u8]) -> (BufferType, BufferType) {
-	let param =
-		BufferType::EncPackedHeaderParameter(EncPackedHeaderParameter::new(kind, (data.len() * 8) as u32, true));
+/// Returns the packed-header parameter and data buffers for the first `bits` of `data`, a NAL unit that carries its own emulation prevention.
+fn packed_header(kind: EncPackedHeaderType, data: &[u8], bits: usize) -> [BufferType; 2] {
+	let param = BufferType::EncPackedHeaderParameter(EncPackedHeaderParameter::new(kind, bits as u32, true));
 	let payload = BufferType::EncPackedHeaderData(data.to_vec());
-	(param, payload)
+	[param, payload]
 }
 
 #[cfg(test)]
@@ -1628,7 +1656,8 @@ mod tests {
 		]
 	}
 
-	/// Lowering the bitrate mid-stream shrinks the pictures without an IDR.
+	/// Lowering the bitrate mid-stream shrinks the pictures without an IDR, and
+	/// the rate controller holds the stream near each target.
 	#[test]
 	fn a_bitrate_change_takes_effect_without_a_keyframe() {
 		for codec in CODECS {
@@ -1644,24 +1673,25 @@ mod tests {
 			return;
 		};
 		let (idr_type, _) = idr_types(codec);
-		// The moving block over light noise: enough detail that 2 Mbps is
-		// spent, not so much that the quantizer bound decides the size instead
-		// of the rate controller.
-		let mut state = 0x2545_f491_u32;
-		let mut frame = |step: u32| {
-			let mut frame = nv12_frame(WIDTH, HEIGHT, step);
-			for sample in &mut frame[..(WIDTH * HEIGHT) as usize] {
-				state ^= state << 13;
-				state ^= state >> 17;
-				state ^= state << 5;
-				*sample = sample.saturating_add((state >> 28) as u8);
+		// A zone plate whose phase moves every picture: detail motion
+		// compensation cannot predict, so 2 Mbps is spent, yet the drivers
+		// can code it at 250 kbps when the quantizer may go high enough.
+		let frame = |step: u32| {
+			let (w, h) = (WIDTH as usize, HEIGHT as usize);
+			let mut frame = vec![128u8; w * h + w * h.div_ceil(2)];
+			for y in 0..h {
+				for x in 0..w {
+					let (dx, dy) = (x as f64 - w as f64 / 2.0, y as f64 - h as f64 / 2.0);
+					let phase = (dx * dx + dy * dy) * 0.002 + f64::from(step) * 0.5;
+					frame[y * w + x] = (128.0 + 100.0 * phase.cos()) as u8;
+				}
 			}
 			frame
 		};
 		// The mean picture size over the second half of 60 frames, once the
 		// rate controller has settled.
 		// Also asserts that no picture after the first is an IDR.
-		let mut average = |encoder: &mut Encoder, from: u32| {
+		let average = |encoder: &mut Encoder, from: u32| {
 			let sizes: Vec<usize> = (from..from + 60)
 				.map(|step| {
 					let unit = encoder.encode_nv12(&frame(step), false).expect("encode");
@@ -1677,12 +1707,24 @@ mod tests {
 			sizes[30..].iter().sum::<usize>() / 30
 		};
 
+		// A settled stream within a quarter above its target; a quantizer
+		// ceiling the rate controller cannot get past misses by double or more.
+		let within = |bytes: usize, bitrate: u32| {
+			let target = bitrate as usize / 8 / 30;
+			assert!(
+				bytes * 4 <= target * 5,
+				"{codec:?} at {bitrate} bps: {bytes} bytes per picture, the target is {target}"
+			);
+		};
+
 		let high = average(&mut encoder, 0);
+		within(high, 2_000_000);
 		encoder.set_bitrate(250_000).expect("set the bitrate");
 		assert_eq!(encoder.config().bitrate, 250_000);
 		assert!(encoder.set_bitrate(0).is_err(), "a zero bitrate is refused");
 		let low = average(&mut encoder, 60);
 		eprintln!("{codec:?} mean picture at 2 Mbps: {high} bytes, at 250 kbps: {low} bytes");
+		within(low, 250_000);
 		assert!(
 			low * 3 < high,
 			"{codec:?}: the rate did not drop: {high} -> {low} bytes per picture"
