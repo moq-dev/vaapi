@@ -66,14 +66,15 @@ pub enum IsReference {
 	LongTerm,
 }
 
-/// Quantizer bounds carried over from the cros-codecs encoder.
+/// Quantizer bounds for the rate controller.
 ///
-/// The full H.264 range lets Intel's CBR controller spend too much of a GOP on
-/// its IDR and then raise the P-frame quantizer enough to produce a visible
-/// quality pulse. These bounds trade strict CBR at the extremes for stable
-/// picture quality.
+/// The floor keeps an IDR on easy content from taking a large share of the
+/// rate. The ceiling is the codecs' own: iHD and radeonsi both honor it, so a
+/// lower one sets a smallest picture, and a stream asked for less overshoots
+/// its rate several times over. A lower ceiling does steady iHD's H.264 IDRs,
+/// but under congestion missing the rate costs more than that.
 const MIN_QP: u8 = 18;
-const MAX_QP: u8 = 36;
+const MAX_QP: u8 = 51;
 /// Window over which libva's rate controller targets the configured bitrate.
 ///
 /// This matches cros-codecs. The old `framerate * 1000` value confused frames
@@ -1654,7 +1655,8 @@ mod tests {
 		]
 	}
 
-	/// Lowering the bitrate mid-stream shrinks the pictures without an IDR.
+	/// Lowering the bitrate mid-stream shrinks the pictures without an IDR, and
+	/// the rate controller holds the stream near each target.
 	#[test]
 	fn a_bitrate_change_takes_effect_without_a_keyframe() {
 		for codec in CODECS {
@@ -1670,24 +1672,25 @@ mod tests {
 			return;
 		};
 		let (idr_type, _) = idr_types(codec);
-		// The moving block over light noise: enough detail that 2 Mbps is
-		// spent, not so much that the quantizer bound decides the size instead
-		// of the rate controller.
-		let mut state = 0x2545_f491_u32;
-		let mut frame = |step: u32| {
-			let mut frame = nv12_frame(WIDTH, HEIGHT, step);
-			for sample in &mut frame[..(WIDTH * HEIGHT) as usize] {
-				state ^= state << 13;
-				state ^= state >> 17;
-				state ^= state << 5;
-				*sample = sample.saturating_add((state >> 28) as u8);
+		// A zone plate whose phase moves every picture: detail motion
+		// compensation cannot predict, so 2 Mbps is spent, yet the drivers
+		// can code it at 250 kbps when the quantizer may go high enough.
+		let frame = |step: u32| {
+			let (w, h) = (WIDTH as usize, HEIGHT as usize);
+			let mut frame = vec![128u8; w * h + w * h.div_ceil(2)];
+			for y in 0..h {
+				for x in 0..w {
+					let (dx, dy) = (x as f64 - w as f64 / 2.0, y as f64 - h as f64 / 2.0);
+					let phase = (dx * dx + dy * dy) * 0.002 + f64::from(step) * 0.5;
+					frame[y * w + x] = (128.0 + 100.0 * phase.cos()) as u8;
+				}
 			}
 			frame
 		};
 		// The mean picture size over the second half of 60 frames, once the
 		// rate controller has settled.
 		// Also asserts that no picture after the first is an IDR.
-		let mut average = |encoder: &mut Encoder, from: u32| {
+		let average = |encoder: &mut Encoder, from: u32| {
 			let sizes: Vec<usize> = (from..from + 60)
 				.map(|step| {
 					let unit = encoder.encode_nv12(&frame(step), false).expect("encode");
@@ -1703,12 +1706,24 @@ mod tests {
 			sizes[30..].iter().sum::<usize>() / 30
 		};
 
+		// A settled stream within a quarter above its target; a quantizer
+		// ceiling the rate controller cannot get past misses by double or more.
+		let within = |bytes: usize, bitrate: u32| {
+			let target = bitrate as usize / 8 / 30;
+			assert!(
+				bytes * 4 <= target * 5,
+				"{codec:?} at {bitrate} bps: {bytes} bytes per picture, the target is {target}"
+			);
+		};
+
 		let high = average(&mut encoder, 0);
+		within(high, 2_000_000);
 		encoder.set_bitrate(250_000).expect("set the bitrate");
 		assert_eq!(encoder.config().bitrate, 250_000);
 		assert!(encoder.set_bitrate(0).is_err(), "a zero bitrate is refused");
 		let low = average(&mut encoder, 60);
 		eprintln!("{codec:?} mean picture at 2 Mbps: {high} bytes, at 250 kbps: {low} bytes");
+		within(low, 250_000);
 		assert!(
 			low * 3 < high,
 			"{codec:?}: the rate did not drop: {high} -> {low} bytes per picture"
