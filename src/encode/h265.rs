@@ -250,11 +250,19 @@ impl Stream {
 			self.slice_parameters(slice_type, reference.as_ref()),
 		];
 		if picture.idr && packed & VA_ENC_PACKED_HEADER_SEQUENCE != 0 {
-			buffers.extend(super::packed_header(EncPackedHeaderType::Sequence, &self.headers, self.headers.len() * 8));
+			buffers.extend(super::packed_header(
+				EncPackedHeaderType::Sequence,
+				&self.headers,
+				self.headers.len() * 8,
+			));
 		}
 		if packed & VA_ENC_PACKED_HEADER_SLICE != 0 {
 			let header = self.slice_header(nal_type, slice_type, picture.count);
-			buffers.extend(super::packed_header(EncPackedHeaderType::Slice, &header, header.len() * 8));
+			buffers.extend(super::packed_header(
+				EncPackedHeaderType::Slice,
+				&header,
+				header.len() * 8,
+			));
 		}
 		buffers
 	}
