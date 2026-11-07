@@ -35,12 +35,10 @@ pulled in as a git dependency.
   Checked on Intel Meteor Lake (iHD 26.1.5) by decoding with ffmpeg: luma
   above 35 dB PSNR against the source, and RGB converted to BT.601 and BT.709
   to within a few code values. These run as tests, for both codecs, wherever
-  ffmpeg and a VA-API device are both present. H.265 passes them on Intel
-  Arrow Lake (iHD 26.1.2). On AMD Radeon RX 9070 (radeonsi, Mesa 26.0.8) it
-  passes all but the color conversion and bitrate checks: chroma converted by
-  the video processor lands about 7 code values off, for either codec, and
-  radeonsi's rate control runs about 4x over 250 kbps on per-frame noise. H.264 encode on that card does not yet
-  produce a decodable stream.
+  ffmpeg and a VA-API device are both present. Both codecs pass them on Intel
+  Arrow Lake (iHD 26.3.5) and AMD Radeon RX 9070 (radeonsi, Mesa 26.2.5),
+  where the stream also holds within a quarter of its bitrate from 2 Mbps down
+  to 250 kbps.
 - **DMA-BUF import and video post-processing.** `dmabuf` wraps a DRM PRIME
   buffer as a surface without copying it; `vpp` blits one surface into another
   through `VAEntrypointVideoProc`, scaling, converting, and re-tiling on the

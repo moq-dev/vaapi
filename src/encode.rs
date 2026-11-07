@@ -27,11 +27,12 @@
 //!   the GPU.
 //! - [`Encoder::encode_nv12`] uploads CPU pixels.
 //!
-//! Checked on Intel Meteor Lake with the iHD driver by decoding with ffmpeg's
-//! software decoder: CPU and DMA-BUF input come back above 35 dB luma PSNR,
-//! and BGRX converts to BT.601 and BT.709 with every channel within 6 code
-//! values of the reference. The low-power entrypoint is untested, since that
-//! device exposes the full one.
+//! Checked on Intel Meteor Lake and Arrow Lake with the iHD driver, and on an
+//! AMD RX 9070 with radeonsi, by decoding with ffmpeg's software decoder: CPU
+//! and DMA-BUF input come back above 35 dB luma PSNR, and BGRX converts to
+//! BT.601 and BT.709 with every channel within 6 code values of the reference.
+//! The low-power entrypoint is untested, since those devices expose the full
+//! one.
 
 use std::path::PathBuf;
 use std::rc::Rc;
