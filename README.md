@@ -127,7 +127,8 @@ nix develop --command just bindgen   # regenerate src/bindings/libva.rs
 ```
 
 The crate compiles on macOS for development, with no link-time dependency on
-libva.
+libva. The dev shell covers Linux and Apple silicon; on an Intel Mac, run
+`cargo check` with a local Rust toolchain instead.
 
 ## Licensing
 
