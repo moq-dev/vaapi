@@ -3,7 +3,8 @@ name: Check
 permissions:
   contents: read
 
-# Post-merge only: pull requests run no CI, so run `just ci` before pushing.
+# Post-merge only: pull requests run no CI, so run `nix develop --command just ci`
+# before pushing.
 on:
   push:
     branches: [main]
