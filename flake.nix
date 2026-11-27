@@ -2,11 +2,18 @@
   description = "moq-vaapi - VA-API hardware video codecs (vendored libva)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # quest's nixpkgs, so every repository's dev shell gets the same C compiler and mbx
+    # shares build scripts, proc-macros, and the crates built on them across repositories.
+    nixpkgs.follows = "quest/nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
+    };
+    # Only its nixpkgs is used.
+    quest = {
+      url = "github:kixel-ai/quest";
+      inputs.flake-utils.follows = "flake-utils";
     };
   };
 
